@@ -1,0 +1,127 @@
+# ██████╗ ███████╗██████╗ ███████╗
+# ██╔══██╗██╔════╝██╔══██╗██╔════╝
+# ██████╔╝█████╗  ██████╔╝███████╗
+# ██╔══██╗██╔══╝  ██╔═══╝ ╚════██║
+# ██║  ██║███████╗██║     ███████║
+# ╚═╝  ╚═╝╚══════╝╚═╝     ╚══════╝
+#╔═══════════════════════════════╗
+#║ Rust Efficiency & Performance ║
+#╚═══════════════════════════════╝
+[package]
+name    = "better-bucket"
+version = "0.1.0"
+
+# Minimum Supported Rust Version (MSRV)
+rust-version = "1.85"
+edition = "2024"
+
+# License
+license = "Apache-2.0 OR MIT"
+
+# Readme
+readme = "README.md"
+
+# Description
+description = "A genuinely better token bucket for Rust: lock-free, allocation-free acquire path, cache-aligned, overflow-safe, with a one-line Tier-1 API and a mockable clock for deterministic tests."
+
+# Keywords (5 max)
+keywords = [
+    "rate-limiting",
+    "token-bucket",
+    "throttle",
+    "lock-free",
+    "backpressure"
+]
+
+# Categories
+categories = [
+    "concurrency",
+    "algorithms",
+    "no-std"
+]
+
+# Links
+homepage      = "https://github.com/jamesgober/better-bucket"
+repository    = "https://github.com/jamesgober/better-bucket"
+documentation = "https://docs.rs/better-bucket"
+
+# Authors
+authors = [
+    "James Gober <me@jamesgober.com>"
+]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+name = "better_bucket"
+path = "src/lib.rs"
+
+# LINTS
+# #################################
+# `loom` is a build-time cfg toggled via `RUSTFLAGS="--cfg loom"` for the
+# concurrency model-check harness; `docsrs` is set by docs.rs. Registering both
+# keeps the `unexpected_cfgs` lint quiet under `-D warnings`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(loom)',
+    'cfg(docsrs)',
+] }
+
+
+
+# FEATURE FLAGS
+# #################################
+[features]
+# Default build: std on, monotonic system clock available.
+default = ["std", "clock"]
+
+# Standard library. With it off, the crate is `no_std` and the caller must
+# drive time explicitly (inject ticks / a custom Clock). The lock-free core
+# does not require std. Propagates std to clock-lib when that feature is on.
+std = ["clock-lib?/std"]
+
+# Pluggable clock source (clock-lib): monotonic time + a mockable clock for
+# deterministic, sleep-free tests. On by default; turn off for a pure
+# caller-driven-tick build.
+clock = ["dep:clock-lib"]
+
+
+
+# DEPENDENCIES
+# #################################
+[dependencies]
+clock-lib = { version = "1.0", optional = true, default-features = false }
+
+
+
+# DEV DEPENDENCIES
+# #################################
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest  = "1"
+
+# `loom` is only pulled in under `cfg(loom)` model-checking builds
+# (`RUSTFLAGS="--cfg loom" cargo test`). It is not a normal test dependency.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+
+
+# BENCHMARKS
+# #################################
+[[bench]]
+name    = "bucket_bench"
+harness = false
+
+
+
+# RELEASE PROFILE
+# #################################
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+strip         = "symbols"
