@@ -16,14 +16,15 @@
 //!
 //! ## Status
 //!
-//! Pre-1.0, under active development. This `0.1.0` release is the **scaffold**:
-//! it establishes the crate metadata, the quality-gate tooling, and the
-//! documented shape of the API that lands across the `0.x` series. There is no
-//! token-bucket logic yet — the foundation API arrives in `0.2.0` and the real
-//! lock-free core in `0.3.0`. The surface below is the target the documentation
-//! describes; it is not callable in this release.
+//! Pre-1.0, under active development. The `0.2` foundation release locks the
+//! public surface — [`Bucket`], [`BucketConfig`], [`Decision`], [`BucketError`],
+//! and the [`TokenBucket`] trait — on a simple, correct, single-threaded
+//! implementation. The lock-free, allocation-free, cache-aligned core that
+//! earns the crate its name replaces the internals in `0.3` **without changing
+//! this surface**.
 //!
-//! ```text
+//! ```
+//! # #[cfg(feature = "clock")] {
 //! use better_bucket::Bucket;
 //!
 //! // 100 tokens per second, capacity 100.
@@ -34,7 +35,14 @@
 //! } else {
 //!     // denied — shed load / return 429 / back off
 //! }
+//! # }
 //! ```
+//!
+//! The bucket reads time from [`clock-lib`](https://crates.io/crates/clock-lib);
+//! the `clock` feature (on by default) provides it and implies `std`. A bare
+//! `no_std` build (`default-features = false`) currently exposes only
+//! [`VERSION`] — the no_std-capable, caller-driven core lands with the lock-free
+//! rewrite in `0.3`.
 //!
 //! ## Design goals
 //!
@@ -75,6 +83,27 @@
 #![deny(clippy::unreachable)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+// The token-bucket surface requires a clock to read time and a `Mutex` for the
+// simple implementation; both are gated on `clock` (which implies `std`). The
+// no_std, caller-driven core arrives with the lock-free rewrite in 0.3.
+#[cfg(feature = "clock")]
+mod bucket;
+#[cfg(feature = "clock")]
+mod config;
+#[cfg(feature = "clock")]
+mod decision;
+#[cfg(feature = "clock")]
+mod error;
+
+#[cfg(feature = "clock")]
+pub use crate::bucket::{Bucket, TokenBucket};
+#[cfg(feature = "clock")]
+pub use crate::config::BucketConfig;
+#[cfg(feature = "clock")]
+pub use crate::decision::Decision;
+#[cfg(feature = "clock")]
+pub use crate::error::BucketError;
+
 /// The version of this crate, taken from `Cargo.toml` at compile time.
 ///
 /// Exposed so a consumer can report the exact `better-bucket` build it links
@@ -86,7 +115,7 @@
 /// ```
 /// // Reports the current 0.x series and carries a major.minor.patch core.
 /// let version = better_bucket::VERSION;
-/// assert!(version.starts_with("0.1"));
+/// assert!(version.starts_with("0.2"));
 /// assert_eq!(version.split('.').count(), 3);
 /// ```
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

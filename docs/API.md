@@ -3,50 +3,52 @@
 > Complete reference for every public item in `better-bucket`, with examples.
 > Format mirrors the portfolio standard ([metrics-lib API.md](https://github.com/jamesgober/metrics-lib/blob/main/docs/API.md)).
 >
-> **Status: pre-1.0.** This document tracks the API surface as it lands across
-> the `0.x` series. `0.1.0` is the scaffold; the only item it actually ships is
-> the [`VERSION`](#version) constant. Sections marked _(planned)_ describe the
-> intended surface and are filled in as each roadmap phase ships — the
-> foundation types in `0.2.0`, the lock-free core in `0.3.0`.
+> **Status: pre-1.0.** The `0.2` foundation release locks the public surface
+> documented below on a simple, correct implementation. The lock-free core in
+> `0.3` replaces the internals without changing any of these signatures.
+> Items marked _(planned)_ are not yet shipped.
 
 ## Table of Contents
 
 - [Installation](#installation)
 - [Overview](#overview)
+- [Tier 1 — the lazy path](#tier-1--the-lazy-path)
+  - [`Bucket::per_second`](#bucketper_second)
+  - [`Bucket::per_duration`](#bucketper_duration)
+  - [`Bucket::try_acquire`](#buckettry_acquire)
+  - [`Bucket::acquire`](#bucketacquire)
+  - [`Bucket::available`](#bucketavailable)
+  - [`Bucket::capacity`](#bucketcapacity)
+- [Tier 2 — the configured path](#tier-2--the-configured-path)
+  - [`BucketConfig`](#bucketconfig)
+  - [`Bucket::from_config`](#bucketfrom_config)
+  - [`Bucket::with_clock`](#bucketwith_clock)
+  - [`Bucket::config`](#bucketconfig-method)
+  - [`Bucket::builder`](#bucketbuilder) _(planned: 0.5)_
+- [Tier 3 — the power path](#tier-3--the-power-path)
+  - [`TokenBucket` trait](#tokenbucket-trait)
+- [Types](#types)
+  - [`Decision`](#decision)
+  - [`BucketError`](#bucketerror)
 - [Crate metadata](#crate-metadata)
   - [`VERSION`](#version)
-- [Tier 1 — the lazy path](#tier-1--the-lazy-path)
-  - [`Bucket::per_second`](#bucketper_second) _(planned: 0.2)_
-  - [`Bucket::per_duration`](#bucketper_duration) _(planned: 0.2)_
-  - [`Bucket::try_acquire`](#buckettry_acquire) _(planned: 0.2)_
-  - [`Bucket::acquire`](#bucketacquire) _(planned: 0.2)_
-  - [`Bucket::available`](#bucketavailable) _(planned: 0.2)_
-- [Tier 2 — the configured path](#tier-2--the-configured-path)
-  - [`Bucket::builder`](#bucketbuilder) _(planned: 0.5)_
-  - [`BucketBuilder`](#bucketbuilder-type) _(planned: 0.5)_
-  - [`Bucket::with_clock`](#bucketwith_clock) _(planned: 0.5)_
-- [Tier 3 — the power path](#tier-3--the-power-path)
-  - [`TokenBucket` trait](#tokenbucket-trait) _(planned: 0.2)_
-- [Errors](#errors) _(planned: 0.2)_
 - [Feature flags](#feature-flags)
 
 ---
 
 ## Installation
 
-Add the crate to your `Cargo.toml`:
-
 ```toml
 [dependencies]
-better-bucket = "0.1"
+better-bucket = "0.2"
 ```
 
-For a `no_std` build — the standard library is dropped and the caller supplies
-time explicitly rather than relying on the bundled clock:
+`no_std` build (exposes only [`VERSION`](#version) until the `0.3` caller-driven
+core; the `Bucket` surface needs the default `clock` feature):
 
 ```toml
 [dependencies]
-better-bucket = { version = "0.1", default-features = false }
+better-bucket = { version = "0.2", default-features = false }
 ```
 
 MSRV is **1.85** (Rust 2024 edition).
@@ -55,16 +57,22 @@ MSRV is **1.85** (Rust 2024 edition).
 
 ## Overview
 
-`better-bucket` exposes a lock-free, allocation-free token bucket. The common
-case is a constructor plus `try_acquire`; advanced use is a builder plus an
-optional injected clock; the full surface is the `TokenBucket` trait.
+`better-bucket` exposes a single token bucket behind a small surface:
 
-The hot path never allocates and never locks. Refill is lazy — tokens accrue
-from monotonic elapsed time when you call `try_acquire` / `available`. The
-core safety guarantee is that the bucket **never over-grants** under any
-concurrent interleaving.
+- **Tier 1** — a constructor (`per_second` / `per_duration`) plus `try_acquire`.
+  The 80% case, one line each.
+- **Tier 2** — a validated [`BucketConfig`] for full control, plus clock
+  injection via [`with_clock`](#bucketwith_clock).
+- **Tier 3** — the [`TokenBucket`](#tokenbucket-trait) trait, the abstraction a
+  consumer (e.g. `rate-net`) codes against.
 
-```text
+The acquire path is infallible — it returns a [`Decision`](#decision), never a
+`Result`. The only fallible operation is building a [`BucketConfig`](#bucketconfig),
+which rejects unworkable parameters at construction. Refill is lazy: tokens
+accrue from the monotonic clock when you call an accessor, never from a
+background thread.
+
+```rust
 use better_bucket::Bucket;
 
 let bucket = Bucket::per_second(100);
@@ -73,8 +81,498 @@ if bucket.try_acquire(1) {
 }
 ```
 
-> The block above shows the target surface; the token types land in `0.2.0`.
-> The section below documents what `0.1.0` actually exports.
+---
+
+## Tier 1 — the lazy path
+
+### `Bucket::per_second`
+
+```rust
+pub fn per_second(rate: u32) -> Bucket<SystemClock>
+```
+
+Creates a bucket of capacity `rate` that refills `rate` tokens per second,
+starting full, driven by the OS monotonic clock. This is the headline
+constructor.
+
+**Parameters**
+
+- `rate` — both the capacity (burst ceiling) and the per-second refill amount. A
+  `rate` of `0` yields a bucket that grants nothing (capacity `0`); use
+  [`BucketConfig::new`](#bucketconfig) when you want `0` rejected as an error.
+
+**Returns** a `Bucket<SystemClock>`, ready to use.
+
+**Examples**
+
+```rust
+use better_bucket::Bucket;
+
+let bucket = Bucket::per_second(50);
+assert_eq!(bucket.capacity(), 50);
+assert!(bucket.try_acquire(1));
+```
+
+Draining and refilling (with an injected clock for determinism):
+
+```rust
+use better_bucket::Bucket;
+use clock_lib::ManualClock;
+use std::sync::Arc;
+use std::time::Duration;
+
+let clock = Arc::new(ManualClock::new());
+let bucket = Bucket::per_second(10).with_clock(Arc::clone(&clock));
+
+assert!(bucket.try_acquire(10)); // drain
+assert!(!bucket.try_acquire(1)); // empty
+clock.advance(Duration::from_secs(1));
+assert_eq!(bucket.available(), 10); // refilled
+```
+
+### `Bucket::per_duration`
+
+```rust
+pub fn per_duration(amount: u32, period: Duration) -> Bucket<SystemClock>
+```
+
+Creates a bucket of capacity `amount` that refills `amount` tokens every
+`period`, starting full. Use this when the natural rate is not per-second.
+
+**Parameters**
+
+- `amount` — capacity and the per-`period` refill amount.
+- `period` — the period over which `amount` accrues.
+
+A zero `amount` or zero `period` yields a bucket that grants nothing.
+
+**Examples**
+
+```rust
+use better_bucket::Bucket;
+use std::time::Duration;
+
+// 5 tokens every 100ms.
+let bucket = Bucket::per_duration(5, Duration::from_millis(100));
+assert_eq!(bucket.capacity(), 5);
+```
+
+```rust
+use better_bucket::Bucket;
+use std::time::Duration;
+
+// 1000 tokens per minute.
+let bucket = Bucket::per_duration(1000, Duration::from_secs(60));
+assert!(bucket.try_acquire(1000));
+```
+
+### `Bucket::try_acquire`
+
+```rust
+pub fn try_acquire(&self, n: u32) -> bool
+```
+
+Attempts to take `n` tokens, returning whether it succeeded. The one-line
+convenience over [`acquire`](#bucketacquire) — equivalent to
+`self.acquire(n).is_allowed()`. Never blocks, never allocates.
+
+**Parameters**
+
+- `n` — tokens to take. `0` always succeeds; more than the capacity always
+  fails.
+
+**Returns** `true` if `n` tokens were available and have been deducted; `false`
+otherwise (the bucket is left untouched).
+
+**Examples**
+
+```rust
+use better_bucket::Bucket;
+
+let bucket = Bucket::per_second(1);
+assert!(bucket.try_acquire(1));
+assert!(!bucket.try_acquire(1)); // drained
+```
+
+Admission control:
+
+```rust
+use better_bucket::Bucket;
+
+let limiter = Bucket::per_second(100);
+fn handle() {}
+
+if limiter.try_acquire(1) {
+    handle();
+} else {
+    // shed load: return 429, drop, or back off
+}
+```
+
+### `Bucket::acquire`
+
+```rust
+pub fn acquire(&self, n: u32) -> Decision
+```
+
+Attempts to take `n` tokens, returning the full [`Decision`](#decision). On
+success the tokens are deducted and the result is `Decision::Allowed`. On
+failure the bucket is untouched and the result is `Decision::Denied`, carrying
+the minimum `retry_after` until the same request would succeed.
+
+**Parameters**
+
+- `n` — tokens to take.
+
+**Returns** a [`Decision`](#decision). Requesting more than the capacity returns
+`Denied { retry_after: Duration::MAX }` (it can never succeed).
+
+**Examples**
+
+```rust
+use better_bucket::{Bucket, Decision};
+
+let bucket = Bucket::per_second(5);
+assert_eq!(bucket.acquire(3), Decision::Allowed);
+assert_eq!(bucket.available(), 2);
+```
+
+Using the retry hint:
+
+```rust
+use better_bucket::{Bucket, Decision};
+
+let bucket = Bucket::per_second(10);
+match bucket.acquire(20) {
+    Decision::Allowed => { /* serve */ }
+    Decision::Denied { retry_after } => {
+        // populate a Retry-After header from `retry_after`
+        let _ = retry_after;
+    }
+    _ => {}
+}
+```
+
+### `Bucket::available`
+
+```rust
+pub fn available(&self) -> u32
+```
+
+Returns how many whole tokens are available right now, after applying lazy
+refill. Reading `available` brings the bucket current the same way an acquire
+does.
+
+**Examples**
+
+```rust
+use better_bucket::Bucket;
+
+let bucket = Bucket::per_second(10);
+assert_eq!(bucket.available(), 10);
+assert!(bucket.try_acquire(4));
+assert_eq!(bucket.available(), 6);
+```
+
+### `Bucket::capacity`
+
+```rust
+pub const fn capacity(&self) -> u32
+```
+
+Returns the bucket's capacity — its burst ceiling, the maximum tokens it can
+hold.
+
+**Examples**
+
+```rust
+use better_bucket::Bucket;
+
+assert_eq!(Bucket::per_second(64).capacity(), 64);
+```
+
+---
+
+## Tier 2 — the configured path
+
+### `BucketConfig`
+
+```rust
+pub struct BucketConfig { /* private */ }
+
+pub fn new(capacity: u32, refill_amount: u32, refill_period: Duration, initial: u32)
+    -> Result<BucketConfig, BucketError>
+pub const fn capacity(&self) -> u32
+pub const fn refill_amount(&self) -> u32
+pub const fn refill_period(&self) -> Duration
+pub const fn initial(&self) -> u32
+```
+
+The validated parameters that define a bucket: a `capacity` (burst ceiling), a
+sustained rate of `refill_amount` tokens per `refill_period`, and an `initial`
+fill. Construct one with `new`; the Tier-1 constructors build one for you for
+the common case.
+
+**`new` parameters**
+
+- `capacity` — maximum tokens held. Must be `> 0`.
+- `refill_amount` — tokens added each `refill_period`. Must be `> 0`.
+- `refill_period` — the accrual period. Must be non-zero.
+- `initial` — starting tokens, clamped to `capacity`.
+
+**`new` errors**
+
+- [`BucketError::ZeroCapacity`](#bucketerror) — `capacity` was `0`.
+- [`BucketError::ZeroRefillAmount`](#bucketerror) — `refill_amount` was `0`.
+- [`BucketError::ZeroRefillPeriod`](#bucketerror) — `refill_period` was zero.
+
+**Examples**
+
+```rust
+use better_bucket::BucketConfig;
+use std::time::Duration;
+
+let config = BucketConfig::new(500, 100, Duration::from_secs(1), 0)?;
+assert_eq!(config.capacity(), 500);
+assert_eq!(config.refill_amount(), 100);
+assert_eq!(config.initial(), 0);
+# Ok::<(), better_bucket::BucketError>(())
+```
+
+`initial` above `capacity` is clamped, not rejected:
+
+```rust
+use better_bucket::BucketConfig;
+use std::time::Duration;
+
+let config = BucketConfig::new(100, 100, Duration::from_secs(1), 999)?;
+assert_eq!(config.initial(), 100);
+# Ok::<(), better_bucket::BucketError>(())
+```
+
+Rejection of a nonsensical configuration:
+
+```rust
+use better_bucket::{BucketConfig, BucketError};
+use std::time::Duration;
+
+let err = BucketConfig::new(0, 10, Duration::from_secs(1), 0).unwrap_err();
+assert_eq!(err, BucketError::ZeroCapacity);
+```
+
+### `Bucket::from_config`
+
+```rust
+pub fn from_config(config: BucketConfig) -> Bucket<SystemClock>
+```
+
+Creates a bucket from a validated [`BucketConfig`](#bucketconfig), driven by the
+OS monotonic clock. Use it when capacity, rate, and initial fill differ — e.g. a
+large burst ceiling with a slow refill, or a bucket that starts empty.
+
+**Examples**
+
+```rust
+use better_bucket::{Bucket, BucketConfig};
+use std::time::Duration;
+
+// Burst up to 500, refill 100/sec, start empty.
+let config = BucketConfig::new(500, 100, Duration::from_secs(1), 0)?;
+let bucket = Bucket::from_config(config);
+assert_eq!(bucket.available(), 0);
+assert_eq!(bucket.capacity(), 500);
+# Ok::<(), better_bucket::BucketError>(())
+```
+
+### `Bucket::with_clock`
+
+```rust
+pub fn with_clock<C2: Clock>(self, clock: C2) -> Bucket<C2>
+```
+
+Replaces the bucket's time source, resetting it to its initial fill anchored at
+the new clock's current reading. This is the clock-injection seam; the intended
+use is immediately after construction, chiefly in tests, where a
+[`ManualClock`](https://docs.rs/clock-lib) makes refill deterministic with no
+`sleep`.
+
+**Parameters**
+
+- `clock` — any [`Clock`](https://docs.rs/clock-lib) implementation. A shared
+  `ManualClock` is typically passed as `Arc<ManualClock>` (clock-lib implements
+  `Clock` for `Arc<C>`), so the test driver keeps a handle to advance it.
+
+**Examples**
+
+```rust
+use better_bucket::Bucket;
+use clock_lib::ManualClock;
+use std::sync::Arc;
+use std::time::Duration;
+
+let clock = Arc::new(ManualClock::new());
+let bucket = Bucket::per_second(10).with_clock(Arc::clone(&clock));
+
+assert!(bucket.try_acquire(10));
+clock.advance(Duration::from_millis(500)); // half a period
+assert_eq!(bucket.available(), 5);
+```
+
+### `Bucket::config` <a id="bucketconfig-method"></a>
+
+```rust
+pub const fn config(&self) -> BucketConfig
+```
+
+Returns the [`BucketConfig`](#bucketconfig) the bucket was built from, for
+introspection.
+
+**Examples**
+
+```rust
+use better_bucket::Bucket;
+use std::time::Duration;
+
+let bucket = Bucket::per_second(10);
+assert_eq!(bucket.config().refill_period(), Duration::from_secs(1));
+```
+
+### `Bucket::builder` _(planned: 0.5)_
+
+A fluent builder (`Bucket::builder().capacity(..).refill(..).initial(..).build()`)
+is planned for the `0.5` feature-complete release as a convenience over
+[`BucketConfig::new`](#bucketconfig). The config path is its foundation and is
+available now.
+
+---
+
+## Tier 3 — the power path
+
+### `TokenBucket` trait
+
+```rust
+pub trait TokenBucket {
+    fn acquire(&self, n: u32) -> Decision;
+    fn try_acquire(&self, n: u32) -> bool;
+    fn available(&self) -> u32;
+    fn capacity(&self) -> u32;
+}
+```
+
+The abstraction a consumer codes against, so it can hold a bucket without naming
+its concrete clock type. Implemented for every `Bucket<C>`. The methods mirror
+the inherent methods of [`Bucket`] exactly; see those for each contract. The
+trait is object-safe — `&dyn TokenBucket` works.
+
+**Examples**
+
+Holding a bucket behind the trait:
+
+```rust
+use better_bucket::{Bucket, TokenBucket};
+
+fn drain(bucket: &dyn TokenBucket) -> u32 {
+    let mut taken = 0;
+    while bucket.try_acquire(1) {
+        taken += 1;
+    }
+    taken
+}
+
+let bucket = Bucket::per_second(5);
+assert_eq!(drain(&bucket), 5);
+```
+
+Generic over the clock:
+
+```rust
+use better_bucket::{Bucket, TokenBucket};
+use clock_lib::Clock;
+
+fn capacity_of<C: Clock>(bucket: &Bucket<C>) -> u32 {
+    TokenBucket::capacity(bucket)
+}
+
+assert_eq!(capacity_of(&Bucket::per_second(42)), 42);
+```
+
+---
+
+## Types
+
+### `Decision`
+
+```rust
+#[non_exhaustive]
+pub enum Decision {
+    Allowed,
+    Denied { retry_after: Duration },
+}
+
+pub const fn is_allowed(&self) -> bool
+pub const fn is_denied(&self) -> bool
+pub const fn retry_after(&self) -> Option<Duration>
+```
+
+The outcome of [`acquire`](#bucketacquire). `Allowed` means the tokens were
+granted and deducted. `Denied` means the request was refused; `retry_after` is
+the minimum wait until the same request would succeed, or `Duration::MAX` if the
+request asked for more than the capacity (it can never succeed).
+
+`#[non_exhaustive]`: match with a wildcard arm, or use the helper methods.
+
+**Examples**
+
+```rust
+use better_bucket::Decision;
+use std::time::Duration;
+
+assert!(Decision::Allowed.is_allowed());
+assert_eq!(Decision::Allowed.retry_after(), None);
+
+let denied = Decision::Denied { retry_after: Duration::from_millis(250) };
+assert!(denied.is_denied());
+assert_eq!(denied.retry_after(), Some(Duration::from_millis(250)));
+```
+
+### `BucketError`
+
+```rust
+#[non_exhaustive]
+pub enum BucketError {
+    ZeroCapacity,
+    ZeroRefillAmount,
+    ZeroRefillPeriod,
+}
+```
+
+The error returned by [`BucketConfig::new`](#bucketconfig) when a configuration
+cannot describe a working bucket. Each variant names the violated constraint.
+Implements `std::error::Error`, `Display`, and `error_forge::ForgeError`
+(`kind()` returns the variant name, e.g. `"ZeroCapacity"`).
+
+`#[non_exhaustive]`: match with a wildcard arm.
+
+**Examples**
+
+```rust
+use better_bucket::{BucketConfig, BucketError};
+use std::time::Duration;
+
+let err = BucketConfig::new(10, 0, Duration::from_secs(1), 0).unwrap_err();
+assert_eq!(err, BucketError::ZeroRefillAmount);
+assert_eq!(err.to_string(), "refill amount must be greater than zero");
+```
+
+Integrating with the `error-forge` stack:
+
+```rust
+use better_bucket::BucketError;
+use error_forge::ForgeError;
+
+assert_eq!(BucketError::ZeroCapacity.kind(), "ZeroCapacity");
+assert!(!BucketError::ZeroCapacity.is_retryable());
+```
 
 ---
 
@@ -87,74 +585,17 @@ pub const VERSION: &str;
 ```
 
 The version of the linked `better-bucket` crate, captured from `Cargo.toml` at
-compile time via `env!("CARGO_PKG_VERSION")`.
-
-**Why it exists.** A consumer sitting several layers up a dependency tree often
-needs to report or assert the exact bucket build it links against — for startup
-diagnostics, bug reports, or guarding against version skew between a service and
-a sidecar that must agree on rate-limit semantics. Reading the constant is free
-and needs no instance.
-
-**Returns.** A `&'static str` in `MAJOR.MINOR.PATCH` form (plus any pre-release
-suffix). Always non-empty.
+compile time. A `&'static str` in `MAJOR.MINOR.PATCH` form, always non-empty.
+Available in every build configuration, including bare `no_std`.
 
 **Examples**
 
-Print the linked version at startup:
-
 ```rust
 println!("better-bucket {}", better_bucket::VERSION);
-```
 
-Assert a minimum series in an integration test or a build-time check:
-
-```rust
 let version = better_bucket::VERSION;
 assert_eq!(version.split('.').count(), 3); // major.minor.patch
-
-let major = version.split('.').next().unwrap_or("0");
-assert_eq!(major, "0", "expected a 0.x release");
 ```
-
----
-
-## Tier 1 — the lazy path
-
-_The one-line, zero-ceremony surface for the ~80% case. Documented in full as
-the 0.2 foundation release lands. Intended signatures:_
-
-- `Bucket::per_second(n: u32) -> Bucket` — a bucket of capacity `n` that
-  refills `n` tokens per second.
-- `Bucket::per_duration(n: u32, period: Duration) -> Bucket` — `n` tokens per
-  arbitrary period.
-- `Bucket::try_acquire(&self, n: u32) -> bool` — take `n` tokens if available;
-  never blocks, never allocates.
-- `Bucket::acquire(&self, n: u32) -> bool` — alias semantics documented at 0.2.
-- `Bucket::available(&self) -> u32` — tokens available right now (after lazy
-  refill).
-
----
-
-## Tier 2 — the configured path
-
-_Builder surface for capacity / refill / burst / initial fill and clock
-injection. Documented in full at the 0.5 feature-complete release._
-
----
-
-## Tier 3 — the power path
-
-_The `TokenBucket` trait — the surface `rate-net` consumes. Documented as the
-trait stabilises at 0.2._
-
----
-
-## Errors
-
-_Construction-time validation (zero capacity / zero rate) returns a
-domain-specific error built on `error-forge`. The acquire path itself is
-infallible and returns a plain allow/deny outcome. Variants documented at
-0.2._
 
 ---
 
@@ -162,15 +603,12 @@ infallible and returns a plain allow/deny outcome. Variants documented at
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `std`   | yes     | Standard library. Off → `no_std`, caller drives time. Propagates `std` to `clock-lib` when `clock` is also on. |
-| `clock` | yes     | Pluggable [`clock-lib`](https://crates.io/crates/clock-lib) time source + mockable clock for tests. |
+| `std`   | yes     | Standard library. Off → `no_std`. |
+| `clock` | yes     | Pluggable [`clock-lib`](https://crates.io/crates/clock-lib) time source + mockable clock for tests. **Implies `std`** (clock-lib's `Clock` is std-gated), and gates the entire `Bucket` surface. |
 
-Disabling default features yields a pure `no_std`, caller-driven-tick build
-with no `clock-lib` dependency:
-
-```toml
-better-bucket = { version = "0.1", default-features = false }
-```
+A bare `no_std` build (`default-features = false`) currently exposes only
+[`VERSION`](#version). The `Bucket` surface requires the `clock` feature; the
+`no_std`-capable, caller-driven core lands with the lock-free rewrite in `0.3`.
 
 ---
 

@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "better-bucket"
-version = "0.1.0"
+version = "0.2.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -85,14 +85,27 @@ std = ["clock-lib?/std"]
 # Pluggable clock source (clock-lib): monotonic time + a mockable clock for
 # deterministic, sleep-free tests. On by default; turn off for a pure
 # caller-driven-tick build.
-clock = ["dep:clock-lib"]
+#
+# `clock` implies `std`: clock-lib's `Clock` trait (and `ManualClock`) are
+# themselves std-gated, and the current single-bucket implementation uses a
+# std `Mutex` for interior mutability. The lock-free, no_std-capable core
+# lands in 0.3.0 and lifts the std requirement from the caller-driven path.
+clock = ["std", "dep:clock-lib", "dep:error-forge"]
 
 
 
 # DEPENDENCIES
 # #################################
 [dependencies]
+# Monotonic time + a mockable clock for deterministic, sleep-free tests. The
+# time source the bucket reads on the acquire path; injected so consumers
+# (e.g. rate-net) and tests can substitute a ManualClock.
 clock-lib = { version = "1.0", optional = true, default-features = false }
+
+# Domain error type (config validation) via the portfolio error stack, instead
+# of thiserror/anyhow in a library crate. Only the `ForgeError` trait is used;
+# `BucketError` is hand-written so every variant is documented.
+error-forge = { version = "1.0", optional = true }
 
 
 

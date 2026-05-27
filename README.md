@@ -36,7 +36,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Zero <code>unsafe</code> on the public path. <code>no_std</code>-capable.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, in active development.</strong> <code>0.1.0</code> is the <strong>scaffold</strong> — crate metadata, the quality-gate tooling, and the documented shape of the API below. The token-bucket logic lands across the <code>0.x</code> series: the foundation API in <code>0.2.0</code>, the lock-free core in <code>0.3.0</code>; <code>1.0.0</code> is the API freeze. The examples in this README describe that target surface. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for per-release detail.
+        <strong>Status: pre-1.0, in active development.</strong> <code>0.2.0</code> is the <strong>foundation</strong> release: the public surface — <code>Bucket</code>, <code>BucketConfig</code>, <code>Decision</code>, <code>BucketError</code>, and the <code>TokenBucket</code> trait — is in place and exercised by property tests, on a simple, correct implementation. The lock-free, allocation-free, cache-aligned core that earns the crate its name replaces the internals in <code>0.3.0</code> <em>without changing this surface</em>; <code>1.0.0</code> is the API freeze. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for per-release detail.
     </blockquote>
 </div>
 
@@ -80,10 +80,10 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-better-bucket = "0.1"
+better-bucket = "0.2"
 
-# no_std build (caller drives time, no clock-lib):
-better-bucket = { version = "0.1", default-features = false }
+# no_std build (no clock-lib; caller-driven core lands in 0.3):
+better-bucket = { version = "0.2", default-features = false }
 ```
 
 <hr>
@@ -112,17 +112,18 @@ That is the whole common case. No builder, no type parameters, no setup.
 
 ## Configured Buckets (Tier 2)
 
-When you need control over capacity, refill rate, burst, or the initial fill:
+When you need control over capacity, refill rate, and initial fill independently
+— for example a large burst ceiling that refills slowly, or a bucket that starts
+empty — build a validated [`BucketConfig`] and hand it to `Bucket::from_config`:
 
 ```rust
-use better_bucket::Bucket;
+use better_bucket::{Bucket, BucketConfig};
 use std::time::Duration;
 
-let bucket = Bucket::builder()
-    .capacity(500)                       // max tokens the bucket holds
-    .refill(100, Duration::from_secs(1)) // 100 tokens per second
-    .initial(0)                          // start empty
-    .build();
+// 500-token burst ceiling, refilling 100 tokens/second, starting empty.
+let config = BucketConfig::new(500, 100, Duration::from_secs(1), 0)
+    .expect("valid configuration");
+let bucket = Bucket::from_config(config);
 
 // Try to take 10 tokens at once.
 if bucket.try_acquire(10) {
@@ -132,6 +133,11 @@ if bucket.try_acquire(10) {
 // How many are available right now (after lazy refill).
 let left = bucket.available();
 ```
+
+`BucketConfig::new` rejects nonsensical configurations (zero capacity, zero
+refill amount, zero refill period) up front with a [`BucketError`], so an
+invalid bucket can never be constructed. A fluent `Bucket::builder()` is a
+planned Tier-2 convenience for `0.5.0`; the config path above is its foundation.
 
 <hr>
 <br>
@@ -146,10 +152,12 @@ instantly:
 ```rust
 use better_bucket::Bucket;
 use clock_lib::ManualClock;
+use std::sync::Arc;
 use std::time::Duration;
 
-let clock = ManualClock::new();
-let bucket = Bucket::per_second(10).with_clock(clock.clone());
+// Share one clock between the test and the bucket via `Arc`.
+let clock = Arc::new(ManualClock::new());
+let bucket = Bucket::per_second(10).with_clock(Arc::clone(&clock));
 
 // Drain the bucket.
 assert!(bucket.try_acquire(10));
@@ -164,6 +172,12 @@ assert!(bucket.try_acquire(10)); // refilled
 <br>
 
 ## Design
+
+> **Implementation status.** `0.2.0` ships the public surface on a simple,
+> correct implementation (a mutex around millitoken accounting) so the API and
+> the safety invariants can be locked and property-tested first. The lock-free,
+> allocation-free design described below replaces those internals in `0.3.0`
+> behind the *same* public surface — no API change, no recompile for consumers.
 
 ### Lock-free, allocation-free hot path
 
@@ -224,13 +238,18 @@ honestly, including any case not won.
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `std`   | ✅      | Standard library. Off → `no_std`; caller drives time explicitly. |
-| `clock` | ✅      | Pluggable `clock-lib` time source: monotonic clock + mockable clock for tests. |
+| `std`   | ✅      | Standard library. Off → `no_std`. |
+| `clock` | ✅      | Pluggable `clock-lib` time source: monotonic clock + mockable clock for tests. Implies `std` (clock-lib's `Clock` is std-gated). |
 
 ```toml
-# Pure no_std, caller-driven ticks (no clock-lib):
-better-bucket = { version = "0.1", default-features = false }
+# no_std build (no clock-lib):
+better-bucket = { version = "0.2", default-features = false }
 ```
+
+> A bare `no_std` build currently exposes only the crate's `VERSION`; the
+> `Bucket` surface needs the `clock` feature. The `no_std`-capable, caller-driven
+> core (no `std`, no clock dependency) lands with the lock-free rewrite in
+> `0.3.0`.
 
 <hr>
 <br>
@@ -242,8 +261,8 @@ better-bucket = { version = "0.1", default-features = false }
 - ✅ macOS (x86_64, Apple Silicon)
 - ✅ Windows (x86_64)
 
-Atomic behavior is identical across all three; the CI matrix runs every target
-on stable and MSRV. A commit that breaks any platform is a broken commit.
+Behavior is identical across all three; the CI matrix runs every target on
+stable and MSRV. A commit that breaks any platform is a broken commit.
 
 <hr>
 <br>
