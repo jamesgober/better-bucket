@@ -3,9 +3,9 @@
 > Complete reference for every public item in `better-bucket`, with examples.
 > Format mirrors the portfolio standard ([metrics-lib API.md](https://github.com/jamesgober/metrics-lib/blob/main/docs/API.md)).
 >
-> **Status: pre-1.0.** The `0.2` foundation release locks the public surface
-> documented below on a simple, correct implementation. The lock-free core in
-> `0.3` replaces the internals without changing any of these signatures.
+> **Status: pre-1.0.** The `0.3` release ships the lock-free core (a single
+> `compare_exchange_weak` on a packed atomic word, allocation-free) behind the
+> public surface documented below — unchanged from the `0.2` foundation.
 > Items marked _(planned)_ are not yet shipped.
 
 ## Table of Contents
@@ -19,6 +19,7 @@
   - [`Bucket::acquire`](#bucketacquire)
   - [`Bucket::available`](#bucketavailable)
   - [`Bucket::capacity`](#bucketcapacity)
+  - [`Bucket::reset`](#bucketreset)
 - [Tier 2 — the configured path](#tier-2--the-configured-path)
   - [`BucketConfig`](#bucketconfig)
   - [`Bucket::from_config`](#bucketfrom_config)
@@ -40,18 +41,29 @@
 
 ```toml
 [dependencies]
-better-bucket = "0.2"
+better-bucket = "0.3"
 ```
 
-`no_std` build (exposes only [`VERSION`](#version) until the `0.3` caller-driven
-core; the `Bucket` surface needs the default `clock` feature):
+`no_std` build (exposes only [`VERSION`](#version); the `Bucket` surface needs
+the default `clock` feature, which implies `std`):
 
 ```toml
 [dependencies]
-better-bucket = { version = "0.2", default-features = false }
+better-bucket = { version = "0.3", default-features = false }
 ```
 
 MSRV is **1.85** (Rust 2024 edition).
+
+### Limits
+
+State is one `AtomicU64` packing tokens (millitokens, upper 32 bits) and
+milliseconds since construction (lower 32 bits). Two consequences:
+
+- Capacity is effectively capped at **~4.29 million tokens** (`u32::MAX`
+  millitokens); larger values are clamped.
+- `retry_after` is reported at **millisecond** resolution, and the millisecond
+  counter saturates after **~49.7 days** of clock advance, after which refill
+  stalls until [`reset`](#bucketreset) re-anchors it.
 
 ---
 
@@ -261,7 +273,8 @@ pub fn available(&self) -> u32
 
 Returns how many whole tokens are available right now, after applying lazy
 refill. Reading `available` brings the bucket current the same way an acquire
-does.
+does. Under concurrent acquires this is a momentary snapshot — treat it as
+advisory, not a reservation.
 
 **Examples**
 
@@ -289,6 +302,29 @@ hold.
 use better_bucket::Bucket;
 
 assert_eq!(Bucket::per_second(64).capacity(), 64);
+```
+
+### `Bucket::reset`
+
+```rust
+pub fn reset(&self)
+```
+
+Refills the bucket to full and re-anchors its internal millisecond counter to
+the current time. Two uses: discard accumulated debt to grant a fresh burst,
+and keep refill alive on a process that runs longer than the ~49.7-day
+saturation window (call `reset` periodically).
+
+**Examples**
+
+```rust
+use better_bucket::Bucket;
+
+let bucket = Bucket::per_second(4);
+assert!(bucket.try_acquire(4));
+assert_eq!(bucket.available(), 0);
+bucket.reset();
+assert_eq!(bucket.available(), 4);
 ```
 
 ---

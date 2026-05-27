@@ -16,12 +16,14 @@
 //!
 //! ## Status
 //!
-//! Pre-1.0, under active development. The `0.2` foundation release locks the
-//! public surface — [`Bucket`], [`BucketConfig`], [`Decision`], [`BucketError`],
-//! and the [`TokenBucket`] trait — on a simple, correct, single-threaded
-//! implementation. The lock-free, allocation-free, cache-aligned core that
-//! earns the crate its name replaces the internals in `0.3` **without changing
-//! this surface**.
+//! Pre-1.0, under active development. The `0.3` release ships the **lock-free
+//! core**: [`Bucket::try_acquire`] is a single `compare_exchange_weak` on a
+//! packed atomic word, allocation-free, with lazy refill from the monotonic
+//! clock and cache-line alignment against false sharing. The public surface —
+//! [`Bucket`], [`BucketConfig`], [`Decision`], [`BucketError`], and the
+//! [`TokenBucket`] trait — is unchanged from the `0.2` foundation. The
+//! no-over-grant invariant is defended by `loom` model checking, a multi-thread
+//! stress test, and `proptest`.
 //!
 //! ```
 //! # #[cfg(feature = "clock")] {
@@ -115,7 +117,7 @@ pub use crate::error::BucketError;
 /// ```
 /// // Reports the current 0.x series and carries a major.minor.patch core.
 /// let version = better_bucket::VERSION;
-/// assert!(version.starts_with("0.2"));
+/// assert!(version.starts_with("0.3"));
 /// assert_eq!(version.split('.').count(), 3);
 /// ```
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

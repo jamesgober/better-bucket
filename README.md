@@ -36,7 +36,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Zero <code>unsafe</code> on the public path. <code>no_std</code>-capable.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, in active development.</strong> <code>0.2.0</code> is the <strong>foundation</strong> release: the public surface — <code>Bucket</code>, <code>BucketConfig</code>, <code>Decision</code>, <code>BucketError</code>, and the <code>TokenBucket</code> trait — is in place and exercised by property tests, on a simple, correct implementation. The lock-free, allocation-free, cache-aligned core that earns the crate its name replaces the internals in <code>0.3.0</code> <em>without changing this surface</em>; <code>1.0.0</code> is the API freeze. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for per-release detail.
+        <strong>Status: pre-1.0, in active development.</strong> <code>0.3.0</code> ships the <strong>lock-free core</strong>: <code>try_acquire</code> is a single <code>compare_exchange_weak</code> on a packed atomic word, allocation-free and cache-line aligned. The no-over-grant invariant is defended by <code>loom</code> model checking, a multi-thread stress test, an allocation audit, and <code>proptest</code>. The public surface is unchanged from the <code>0.2</code> foundation; remaining <code>0.x</code> work is optimization, hardening, and benchmarks toward the <code>1.0.0</code> API freeze. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for per-release detail.
     </blockquote>
 </div>
 
@@ -61,13 +61,12 @@ A token bucket is simple to get working and surprisingly hard to get <em>right</
 
 ## Features
 
-- **Token bucket core** — lock-free `try_acquire` / `acquire`, packed atomic state, cache-line aligned to avoid false sharing between independent buckets
+- **Token bucket core** — lock-free `try_acquire` / `acquire` (one `compare_exchange_weak` on a packed atomic word), allocation-free, cache-line aligned to avoid false sharing between independent buckets
 - **Lazy refill** — tokens accrue from monotonic elapsed time on access; no background threads, no timers
 - **Overflow-safe math** — checked / saturating arithmetic on every refill and capacity path
 - **Deterministic tests** — inject a mockable clock (via `clock-lib`) and advance time without `sleep`
-- **Tier-1 API** — `Bucket::per_second(n)` / `Bucket::per_duration(n, dur)` for the common case; a builder for control; a trait for the 1%
-- **No over-grant guarantee** — verified with `loom` model checking and `proptest`
-- **`no_std`-capable** — the lock-free core runs without the standard library (caller drives time)
+- **Tier-1 API** — `Bucket::per_second(n)` / `Bucket::per_duration(n, dur)` for the common case; `BucketConfig` for full control; a trait for the 1%
+- **No over-grant guarantee** — verified with `loom` model checking, an allocation audit, a multi-thread stress test, and `proptest`
 - **Zero `unsafe`** on the public path
 
 <br>
@@ -80,10 +79,10 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-better-bucket = "0.2"
+better-bucket = "0.3"
 
-# no_std build (no clock-lib; caller-driven core lands in 0.3):
-better-bucket = { version = "0.2", default-features = false }
+# no_std build (no clock-lib; exposes only VERSION today — see Feature Flags):
+better-bucket = { version = "0.3", default-features = false }
 ```
 
 <hr>
@@ -173,12 +172,6 @@ assert!(bucket.try_acquire(10)); // refilled
 
 ## Design
 
-> **Implementation status.** `0.2.0` ships the public surface on a simple,
-> correct implementation (a mutex around millitoken accounting) so the API and
-> the safety invariants can be locked and property-tested first. The lock-free,
-> allocation-free design described below replaces those internals in `0.3.0`
-> behind the *same* public surface — no API change, no recompile for consumers.
-
 ### Lock-free, allocation-free hot path
 
 The bucket packs its mutable state — current tokens and the last-refill
@@ -209,9 +202,26 @@ limiter from a leaky one, and it is verified two ways:
 
 - **`loom`** exhaustively explores the CAS interleavings of concurrent
   `try_acquire` calls and asserts no lost update and no over-grant.
+- **A multi-thread stress test** hammers one bucket from many threads and
+  asserts the total granted never exceeds the available tokens.
+- **An allocation audit** runs the acquire path under a counting allocator and
+  asserts zero allocations.
 - **`proptest`** throws arbitrary sequences of acquires and time advances at
   the bucket and asserts tokens always stay in `[0, capacity]` and grants
   never exceed what refill allows.
+
+### Packed state and its limits
+
+State is one `AtomicU64`: the upper 32 bits hold tokens in millitokens (for
+sub-token refill resolution), the lower 32 bits hold milliseconds since the
+bucket was created. Two consequences follow from that budget:
+
+- **Capacity tops out around 4.29 million tokens** (`u32::MAX` millitokens).
+  That is an enormous burst ceiling for rate limiting; larger requests are
+  clamped to it.
+- **The millisecond counter saturates after ~49.7 days** of clock advance, after
+  which refill stalls. `Bucket::reset()` re-anchors it (and refills to full), so
+  a process that runs longer than that between resets can call it periodically.
 
 <hr>
 <br>
@@ -243,13 +253,14 @@ honestly, including any case not won.
 
 ```toml
 # no_std build (no clock-lib):
-better-bucket = { version = "0.2", default-features = false }
+better-bucket = { version = "0.3", default-features = false }
 ```
 
-> A bare `no_std` build currently exposes only the crate's `VERSION`; the
-> `Bucket` surface needs the `clock` feature. The `no_std`-capable, caller-driven
-> core (no `std`, no clock dependency) lands with the lock-free rewrite in
-> `0.3.0`.
+> The lock-free accounting core uses only `core` atomics and is `no_std`-capable
+> in principle, but the shipped `Bucket` constructors read time from `clock-lib`
+> and therefore require the default `clock` feature (which implies `std`). A bare
+> `no_std` build currently exposes only the crate's `VERSION`; a caller-driven,
+> clock-free time API is a candidate for a future release.
 
 <hr>
 <br>

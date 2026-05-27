@@ -1,76 +1,51 @@
 //! The single token bucket and the `TokenBucket` trait.
 //!
-//! This is the `0.2` foundation implementation: correct, single-threaded-clean,
-//! and behind a `Mutex` for interior mutability. It is deliberately *not* the
-//! lock-free, allocation-free, cache-aligned core — that replaces the internals
-//! wholesale in `0.3` without changing this public surface.
+//! This is the lock-free core. All mutable state lives in one `AtomicU64` that
+//! packs the current token count and the time of the last refill; `try_acquire`
+//! is a single `compare_exchange_weak` loop with lazy refill computed from the
+//! injected monotonic clock. There is no lock and no allocation on the acquire
+//! path, and the bucket is cache-line aligned so independent buckets never
+//! falsely share. The public surface is identical to the `0.2` foundation
+//! release — only the internals changed.
+//!
+//! # Packing
+//!
+//! The state word is split:
+//! - **upper 32 bits** — tokens in *millitokens* (thousandths of a token), for
+//!   sub-token refill resolution. Capped at [`u32::MAX`] millitokens, so the
+//!   effective capacity ceiling is about 4.29 million tokens.
+//! - **lower 32 bits** — milliseconds since the bucket's `created_at` anchor of
+//!   the last refill computation.
+//!
+//! The millisecond field saturates after ~49.7 days of clock advance, after
+//! which refill stalls; [`Bucket::reset`] re-anchors it for processes that run
+//! longer than that between resets.
 
 use core::time::Duration;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicU64, Ordering};
 
 use clock_lib::{Clock, Monotonic, SystemClock};
+#[cfg(not(loom))]
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::BucketConfig;
 use crate::decision::Decision;
 
-/// Tokens are tracked in thousandths (millitokens) so refill can accrue at
-/// sub-token resolution without losing fractions across calls.
+/// Millitokens per whole token.
 const MILLI: u64 = 1_000;
 
-/// The mutable accounting carried across calls, guarded by the bucket's mutex.
-#[derive(Debug)]
-struct State {
-    /// Tokens currently available, in millitokens.
-    millitokens: u64,
-    /// The monotonic reading at which `millitokens` was last brought current.
-    last_refill: Monotonic,
+/// Packs `millitokens` (clamped to 32 bits) and `last_ms` into one word.
+#[inline]
+fn pack(millitokens: u64, last_ms: u32) -> u64 {
+    (millitokens.min(u64::from(u32::MAX)) << 32) | u64::from(last_ms)
 }
 
-/// A token bucket: a counter that refills over time and grants tokens on demand.
-///
-/// A bucket holds up to its capacity in tokens, accrues more at a fixed rate,
-/// and hands them out when asked. Refill is **lazy** — no background thread, no
-/// timer: the token count is brought current from the monotonic clock at the
-/// moment you call [`acquire`](Self::acquire), [`try_acquire`](Self::try_acquire),
-/// or [`available`](Self::available).
-///
-/// The type parameter `C` is the time source. It defaults to
-/// [`SystemClock`](clock_lib::SystemClock) (the OS monotonic clock); inject a
-/// [`ManualClock`](clock_lib::ManualClock) with [`with_clock`](Self::with_clock)
-/// to drive time by hand in tests. `Bucket` is `Send + Sync` whenever its clock
-/// is, which every [`Clock`] implementation guarantees.
-///
-/// # Examples
-///
-/// The one-line common case:
-///
-/// ```
-/// use better_bucket::Bucket;
-///
-/// let bucket = Bucket::per_second(100);
-/// if bucket.try_acquire(1) {
-///     // allowed — do the work
-/// }
-/// ```
-#[derive(Debug)]
-pub struct Bucket<C: Clock = SystemClock> {
-    config: BucketConfig,
-    clock: C,
-    state: Mutex<State>,
-}
-
-/// Constructs a bucket from a finished config and a clock, anchoring the refill
-/// clock at the supplied clock's current reading and filling to `initial`.
-fn build<C: Clock>(config: BucketConfig, clock: C) -> Bucket<C> {
-    let last_refill = clock.now();
-    Bucket {
-        state: Mutex::new(State {
-            millitokens: u64::from(config.initial()) * MILLI,
-            last_refill,
-        }),
-        config,
-        clock,
-    }
+/// Unpacks the state word into `(millitokens, last_ms)`.
+#[inline]
+fn unpack(state: u64) -> (u64, u32) {
+    (state >> 32, (state & u64::from(u32::MAX)) as u32)
 }
 
 /// Maps a Tier-1 request to a config, collapsing a degenerate request (zero
@@ -85,32 +60,90 @@ fn tier1_config(capacity: u32, amount: u32, period: Duration, initial: u32) -> B
     }
 }
 
-/// Brings `state` current as of `now`, accruing lazy refill (saturating, never
-/// exceeding capacity).
-fn refill(state: &mut State, config: &BucketConfig, now: Monotonic) {
-    let amount = config.refill_amount();
-    let period_nanos = config.refill_period().as_nanos();
-    if amount == 0 || period_nanos == 0 {
-        // A bucket with no refill rate is static; nothing accrues.
-        return;
+/// A token bucket: a counter that refills over time and grants tokens on demand.
+///
+/// A bucket holds up to its capacity in tokens, accrues more at a fixed rate,
+/// and hands them out when asked. The hot path is **lock-free** — a single
+/// `compare_exchange_weak` on a packed atomic word — and **allocation-free**.
+/// Refill is **lazy**: there is no background thread or timer, the token count
+/// is brought current from the monotonic clock the instant you call
+/// [`acquire`](Self::acquire), [`try_acquire`](Self::try_acquire), or
+/// [`available`](Self::available).
+///
+/// The type parameter `C` is the time source. It defaults to
+/// [`SystemClock`](clock_lib::SystemClock) (the OS monotonic clock); inject a
+/// [`ManualClock`](clock_lib::ManualClock) with [`with_clock`](Self::with_clock)
+/// to drive time by hand in tests. `Bucket` is `Send + Sync` whenever its clock
+/// is, which every [`Clock`] implementation guarantees.
+///
+/// # Limits
+///
+/// The packed representation caps capacity at about 4.29 million tokens
+/// (`u32::MAX` millitokens) and tracks time in milliseconds relative to
+/// construction; that millisecond counter saturates after ~49.7 days of clock
+/// advance, stalling refill until [`reset`](Self::reset) re-anchors it.
+///
+/// # Examples
+///
+/// The one-line common case:
+///
+/// ```
+/// use better_bucket::Bucket;
+///
+/// let bucket = Bucket::per_second(100);
+/// if bucket.try_acquire(1) {
+///     // allowed — do the work
+/// }
+/// ```
+#[repr(align(64))]
+pub struct Bucket<C: Clock = SystemClock> {
+    /// Packed `(millitokens << 32) | last_ms`. The only mutable state, and the
+    /// single point of synchronisation.
+    state: AtomicU64,
+    /// Capacity in millitokens, already clamped to the 32-bit packing ceiling.
+    capacity_millitokens: u64,
+    /// Refill numerator: `refill_amount * 1_000_000_000`. Zero means no refill.
+    /// Paired with `period_nanos`, `elapsed_ms * refill_numerator / period_nanos`
+    /// yields the millitokens accrued — exact integer math that keeps
+    /// sub-millisecond periods working despite the millisecond tick.
+    refill_numerator: u64,
+    /// Refill period in nanoseconds. Zero means no refill.
+    period_nanos: u64,
+    /// The monotonic anchor that `last_ms` is measured from.
+    created_at: Monotonic,
+    /// The original configuration, kept for [`config`](Self::config).
+    config: BucketConfig,
+    /// The injected time source.
+    clock: C,
+}
+
+/// Constructs a bucket from a finished config and a clock, anchoring the refill
+/// clock at the supplied clock's current reading and filling to `initial`.
+fn build<C: Clock>(config: BucketConfig, clock: C) -> Bucket<C> {
+    let created_at = clock.now();
+    let capacity_millitokens = u64::from(config.capacity())
+        .saturating_mul(MILLI)
+        .min(u64::from(u32::MAX));
+    // `refill_amount * 1_000` millitokens accrue per `refill_period`; scaling by
+    // a further 1_000_000 lets us divide by the period in *nanoseconds*, which
+    // keeps sub-millisecond periods exact. `0` disables refill.
+    let (refill_numerator, period_nanos) = if config.refill_amount() == 0 {
+        (0, 0)
+    } else {
+        let numerator = u64::from(config.refill_amount()).saturating_mul(1_000_000_000);
+        let period = u64::try_from(config.refill_period().as_nanos()).unwrap_or(u64::MAX);
+        (numerator, period)
+    };
+    let initial_millitokens = (u64::from(config.initial()) * MILLI).min(capacity_millitokens);
+    Bucket {
+        state: AtomicU64::new(pack(initial_millitokens, 0)),
+        capacity_millitokens,
+        refill_numerator,
+        period_nanos,
+        created_at,
+        config,
+        clock,
     }
-    let elapsed_nanos = now.saturating_duration_since(state.last_refill).as_nanos();
-    if elapsed_nanos == 0 {
-        return;
-    }
-    let rate_milli = u128::from(amount) * u128::from(MILLI);
-    let accrued = elapsed_nanos.saturating_mul(rate_milli) / period_nanos;
-    if accrued == 0 {
-        // Not enough time for a whole millitoken yet — keep `last_refill` so
-        // the elapsed time accumulates toward the next accrual.
-        return;
-    }
-    let cap_milli = u128::from(config.capacity()) * u128::from(MILLI);
-    let refilled = u128::from(state.millitokens)
-        .saturating_add(accrued)
-        .min(cap_milli);
-    state.millitokens = u64::try_from(refilled).unwrap_or(u64::MAX);
-    state.last_refill = now;
 }
 
 impl Bucket<SystemClock> {
@@ -259,6 +292,9 @@ impl<C: Clock> Bucket<C> {
 
     /// Returns how many whole tokens are available right now, after lazy refill.
     ///
+    /// This is a momentary snapshot; under concurrent acquires it can be stale
+    /// the instant it returns. Treat it as advisory.
+    ///
     /// # Examples
     ///
     /// ```
@@ -271,10 +307,13 @@ impl<C: Clock> Bucket<C> {
     /// ```
     #[must_use]
     pub fn available(&self) -> u32 {
-        self.available_inner()
+        let now_ms = self.now_ms();
+        let (tokens_mt, last_ms) = unpack(self.state.load(Ordering::Relaxed));
+        let refilled = self.refilled(tokens_mt, last_ms, now_ms);
+        u32::try_from(refilled / MILLI).unwrap_or(u32::MAX)
     }
 
-    /// Returns the bucket's capacity (its burst ceiling).
+    /// Returns the bucket's capacity (its burst ceiling), in whole tokens.
     ///
     /// # Examples
     ///
@@ -285,7 +324,7 @@ impl<C: Clock> Bucket<C> {
     /// ```
     #[must_use]
     pub const fn capacity(&self) -> u32 {
-        self.config.capacity()
+        (self.capacity_millitokens / MILLI) as u32
     }
 
     /// Returns the configuration this bucket was built from.
@@ -304,10 +343,65 @@ impl<C: Clock> Bucket<C> {
         self.config
     }
 
-    fn lock(&self) -> MutexGuard<'_, State> {
-        // The critical section never panics, so the mutex is never genuinely
-        // poisoned; recover the guard regardless rather than propagate.
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    /// Refills the bucket to full and re-anchors its internal clock to now.
+    ///
+    /// Two uses: discard accumulated debt to grant a fresh burst, and re-anchor
+    /// the internal millisecond counter on a process that runs longer than the
+    /// ~49.7-day saturation window (call `reset` periodically to keep refill
+    /// from stalling).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::Bucket;
+    ///
+    /// let bucket = Bucket::per_second(4);
+    /// assert!(bucket.try_acquire(4));
+    /// assert_eq!(bucket.available(), 0);
+    /// bucket.reset();
+    /// assert_eq!(bucket.available(), 4);
+    /// ```
+    pub fn reset(&self) {
+        let now_ms = self.now_ms();
+        self.state
+            .store(pack(self.capacity_millitokens, now_ms), Ordering::Relaxed);
+    }
+
+    /// Milliseconds since `created_at`, saturating into the 32-bit time field.
+    #[inline]
+    fn now_ms(&self) -> u32 {
+        let elapsed = self.clock.now().saturating_duration_since(self.created_at);
+        u32::try_from(elapsed.as_millis().min(u128::from(u32::MAX))).unwrap_or(u32::MAX)
+    }
+
+    /// The millitoken count after refilling over `last_ms → now_ms`, capped at
+    /// capacity. Saturating throughout: a huge elapsed gap fills to capacity, it
+    /// can never wrap or overflow.
+    #[inline]
+    fn refilled(&self, tokens_mt: u64, last_ms: u32, now_ms: u32) -> u64 {
+        if self.refill_numerator == 0 || self.period_nanos == 0 {
+            return tokens_mt;
+        }
+        let elapsed_ms = u64::from(now_ms.saturating_sub(last_ms));
+        let added = u128::from(elapsed_ms).saturating_mul(u128::from(self.refill_numerator))
+            / u128::from(self.period_nanos);
+        let added_mt = u64::try_from(added).unwrap_or(u64::MAX);
+        tokens_mt
+            .saturating_add(added_mt)
+            .min(self.capacity_millitokens)
+    }
+
+    /// The minimum time for `deficit_mt` millitokens to accrue, rounded up.
+    /// [`Duration::MAX`] if the bucket never refills.
+    fn time_for(&self, deficit_mt: u64) -> Duration {
+        if self.refill_numerator == 0 || self.period_nanos == 0 {
+            return Duration::MAX;
+        }
+        let numerator = u128::from(deficit_mt)
+            .saturating_mul(u128::from(self.period_nanos))
+            .saturating_add(u128::from(self.refill_numerator) - 1);
+        let millis = numerator / u128::from(self.refill_numerator);
+        Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX))
     }
 
     fn acquire_inner(&self, n: u32) -> Decision {
@@ -315,52 +409,48 @@ impl<C: Clock> Bucket<C> {
             // Zero tokens are always available, even from an empty bucket.
             return Decision::Allowed;
         }
-        if u64::from(n) > u64::from(self.config.capacity()) {
+        let need_mt = u64::from(n) * MILLI;
+        if need_mt > self.capacity_millitokens {
             // More than the bucket can ever hold: it can never be granted.
             return Decision::Denied {
                 retry_after: Duration::MAX,
             };
         }
 
-        let now = self.clock.now();
-        let need = u64::from(n) * MILLI;
-        let mut state = self.lock();
-        refill(&mut state, &self.config, now);
-
-        if state.millitokens >= need {
-            state.millitokens -= need;
-            Decision::Allowed
-        } else {
-            let deficit = need - state.millitokens;
-            drop(state);
-            Decision::Denied {
-                retry_after: self.time_for(deficit),
+        let now_ms = self.now_ms();
+        loop {
+            let current = self.state.load(Ordering::Relaxed);
+            let (tokens_mt, last_ms) = unpack(current);
+            let refilled = self.refilled(tokens_mt, last_ms, now_ms);
+            if refilled < need_mt {
+                // Denied: report the wait for the shortfall to accrue. No write,
+                // so a denied request never contends with a granting one.
+                return Decision::Denied {
+                    retry_after: self.time_for(need_mt - refilled),
+                };
+            }
+            let next = pack(refilled - need_mt, now_ms);
+            // Relaxed is sufficient: the only shared state is this word, and the
+            // CAS gives the read-modify-write atomicity the no-over-grant
+            // contract depends on. A spurious or lost race retries.
+            if self
+                .state
+                .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Decision::Allowed;
             }
         }
     }
+}
 
-    fn available_inner(&self) -> u32 {
-        let now = self.clock.now();
-        let mut state = self.lock();
-        refill(&mut state, &self.config, now);
-        u32::try_from(state.millitokens / MILLI).unwrap_or(u32::MAX)
-    }
-
-    /// The minimum time for `deficit_milli` millitokens to accrue at the
-    /// configured rate, rounded up. [`Duration::MAX`] if the bucket never
-    /// refills.
-    fn time_for(&self, deficit_milli: u64) -> Duration {
-        let amount = self.config.refill_amount();
-        let period_nanos = self.config.refill_period().as_nanos();
-        if amount == 0 || period_nanos == 0 {
-            return Duration::MAX;
-        }
-        let rate_milli = u128::from(amount) * u128::from(MILLI);
-        let numerator = u128::from(deficit_milli)
-            .saturating_mul(period_nanos)
-            .saturating_add(rate_milli - 1);
-        let nanos = numerator / rate_milli;
-        Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+impl<C: Clock> core::fmt::Debug for Bucket<C> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Bucket")
+            .field("capacity", &self.capacity())
+            .field("available", &self.available())
+            .field("config", &self.config)
+            .finish()
     }
 }
 
@@ -397,15 +487,15 @@ impl<C: Clock> TokenBucket for Bucket<C> {
     }
 
     fn available(&self) -> u32 {
-        self.available_inner()
+        Bucket::available(self)
     }
 
     fn capacity(&self) -> u32 {
-        self.config.capacity()
+        self.capacity()
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     #![allow(clippy::unwrap_used)]
 
@@ -414,6 +504,7 @@ mod tests {
     use clock_lib::{ManualClock, SystemClock};
     use core::time::Duration;
     use std::sync::Arc;
+    use std::thread;
 
     /// A bucket driven by a `ManualClock` the test controls, so refill is
     /// deterministic with no real time passing.
@@ -521,6 +612,18 @@ mod tests {
     }
 
     #[test]
+    fn test_sub_millisecond_period_still_refills() {
+        // 5 tokens per 200µs ⇒ 25 tokens/ms. The millisecond tick is coarse but
+        // the rate is computed from nanoseconds, so a full ms refills fully.
+        let clock = Arc::new(ManualClock::new());
+        let bucket =
+            Bucket::per_duration(5, Duration::from_micros(200)).with_clock(Arc::clone(&clock));
+        assert!(bucket.try_acquire(5));
+        clock.advance(Duration::from_millis(1));
+        assert_eq!(bucket.available(), 5); // capped at capacity
+    }
+
+    #[test]
     fn test_zero_rate_is_deny_all() {
         let bucket = Bucket::per_second(0);
         assert_eq!(bucket.capacity(), 0);
@@ -530,13 +633,61 @@ mod tests {
     }
 
     #[test]
+    fn test_reset_refills_to_capacity() {
+        let (_clock, bucket) = manual_bucket(5);
+        assert!(bucket.try_acquire(5));
+        assert_eq!(bucket.available(), 0);
+        bucket.reset();
+        assert_eq!(bucket.available(), 5);
+    }
+
+    #[test]
     fn test_trait_object_safe_surface() {
-        // The trait is usable through a reference, which is how `rate-net`
-        // holds a bucket without naming its clock type.
         let (_clock, bucket) = manual_bucket(4);
         let as_trait: &dyn TokenBucket = &bucket;
         assert_eq!(as_trait.capacity(), 4);
         assert!(as_trait.try_acquire(4));
         assert!(!as_trait.try_acquire(1));
+    }
+
+    #[test]
+    fn test_concurrent_acquire_never_over_grants() {
+        // 100 tokens, no refill (clock never advances). Eight threads each
+        // demand 30 — total demand 240, available 100. Under a correct CAS,
+        // exactly 100 succeed: no over-grant (≤ 100) and no lost token (= 100).
+        let clock = Arc::new(ManualClock::new());
+        let bucket = Arc::new(Bucket::per_second(100).with_clock(clock));
+        let threads = 8;
+        let demand = 30u32;
+
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let bucket = Arc::clone(&bucket);
+                thread::spawn(move || {
+                    let mut taken = 0u32;
+                    for _ in 0..demand {
+                        if bucket.try_acquire(1) {
+                            taken += 1;
+                        }
+                    }
+                    taken
+                })
+            })
+            .collect();
+
+        let total: u32 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(total, 100, "CAS bucket must grant exactly capacity");
+        assert_eq!(bucket.available(), 0);
+    }
+
+    #[test]
+    fn test_pack_unpack_round_trip() {
+        for &mt in &[0_u64, 1, 1_000, 50_000, u64::from(u32::MAX)] {
+            for &ms in &[0_u32, 1, 1_000, u32::MAX] {
+                let (got_mt, got_ms) = super::unpack(super::pack(mt, ms));
+                assert_eq!(got_mt, mt.min(u64::from(u32::MAX)));
+                assert_eq!(got_ms, ms);
+            }
+        }
     }
 }

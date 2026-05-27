@@ -22,6 +22,44 @@
 
 ---
 
+## [0.3.0] - 2026-05-27
+
+The lock-free core. The mutex-backed `0.2` internals are replaced by a single
+atomic word and a CAS loop; the public surface is unchanged.
+
+### Added
+
+- `Bucket::reset()` — refills to full and re-anchors the internal clock.
+  Useful to grant a fresh burst, and to keep refill alive on processes that
+  run past the ~49.7-day millisecond-counter saturation window.
+- `loom` model check (`tests/loom_acquire.rs`) of the real acquire path,
+  proving the CAS grants exactly the available tokens — no over-grant, no
+  lost token — across every interleaving.
+- Multi-thread stress test (eight threads contending one bucket) asserting
+  total grants never exceed the available tokens.
+- Allocation audit (`tests/alloc.rs`) under a counting global allocator,
+  asserting the acquire path performs zero allocations.
+
+### Changed
+
+- The acquire path is now **lock-free and allocation-free**: all mutable
+  state lives in one `AtomicU64` packing tokens (millitokens, upper 32 bits)
+  and milliseconds-since-creation (lower 32 bits), and `try_acquire` is a
+  single `compare_exchange_weak` loop with lazy refill from the injected
+  monotonic clock. The bucket is `#[repr(align(64))]` to prevent false
+  sharing between independent buckets. Refill math is computed from the
+  refill period in nanoseconds, so sub-millisecond periods stay correct
+  despite the millisecond time tick.
+- The packed representation introduces two documented limits (previously the
+  mutex impl had neither): capacity is effectively capped at ~4.29 million
+  tokens (`u32::MAX` millitokens; larger values clamp), and `retry_after` is
+  reported at millisecond resolution.
+- `loom` moved from a `cfg(loom)` dev-dependency to a `cfg(loom)` dependency,
+  because the library's atomics now switch to `loom::sync::atomic` under that
+  cfg and the lib crate itself must link it.
+
+---
+
 ## [0.2.0] - 2026-05-27
 
 The foundation release. The public surface is locked on a simple, correct,
@@ -124,6 +162,7 @@ implementation will be built on.
 - Libraries do not commit `Cargo.lock` (per portfolio convention); it is
   gitignored.
 
-[Unreleased]: https://github.com/jamesgober/better-bucket/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/better-bucket/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jamesgober/better-bucket/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/better-bucket/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/better-bucket/releases/tag/v0.1.0

@@ -1,53 +1,42 @@
-//! Loom concurrency model check for `better-bucket`.
+//! Loom concurrency model check for the lock-free acquire path.
 //!
 //! Compiled and run only under `RUSTFLAGS="--cfg loom" cargo test --test
 //! loom_acquire`; under a normal build the `#![cfg(loom)]` gate makes this file
-//! empty.
+//! empty. Under that cfg the library's state word is a `loom` atomic, so loom
+//! exhaustively explores the interleavings of concurrent `try_acquire` calls
+//! and checks the safety contract directly on the real `Bucket`.
 //!
-//! `0.1.0` has no acquire path yet, so this model proves two things ahead of
-//! the core: that the loom harness compiles and runs against this crate's
-//! toolchain, and that the contention mechanic the acquire path will use — a
-//! `compare_exchange` loop draining a shared budget — never grants more than
-//! the budget allows under any thread interleaving. The full acquire/refill
-//! interleaving model (the real no-over-grant proof) replaces this in `0.3.0`.
+//! The model uses a bucket whose clock is never advanced, so no refill occurs
+//! during the run — the property under test is the CAS itself: with a fixed
+//! pool of tokens and more demand than supply, the bucket must grant *exactly*
+//! the pool (no over-grant, no lost token) across every interleaving.
 
 #![cfg(loom)]
 
-use loom::sync::Arc;
-use loom::sync::atomic::{AtomicU64, Ordering};
-use loom::thread;
-
-/// Take one unit from a shared budget via CAS, reporting whether it succeeded.
-/// This is the bare contention kernel of the future `try_acquire`.
-fn try_take_one(state: &AtomicU64) -> bool {
-    let mut current = state.load(Ordering::Acquire);
-    loop {
-        if current == 0 {
-            return false;
-        }
-        match state.compare_exchange_weak(current, current - 1, Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => return true,
-            Err(observed) => current = observed,
-        }
-    }
-}
+use better_bucket::Bucket;
+use clock_lib::ManualClock;
 
 #[test]
-fn loom_cas_take_never_over_grants() {
+fn loom_acquire_never_over_grants_or_loses_tokens() {
     loom::model(|| {
-        let budget = Arc::new(AtomicU64::new(1));
-        let racer = Arc::clone(&budget);
+        // Capacity 2, full, no refill (the manual clock is never advanced).
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let bucket = loom::sync::Arc::new(Bucket::per_second(2).with_clock(clock));
 
-        // One thread races the main thread for a single available unit.
-        let handle = thread::spawn(move || try_take_one(&racer));
-        let granted_here = try_take_one(&budget);
-        let granted_there = handle.join().unwrap();
+        let a = loom::sync::Arc::clone(&bucket);
+        let b = loom::sync::Arc::clone(&bucket);
 
-        // Budget was 1: at most one side may win — never both, never neither
-        // when a unit was available to exactly one of them.
-        let granted = u64::from(granted_here) + u64::from(granted_there);
-        assert!(granted <= 1, "over-grant: budget of 1 handed out {granted}");
-        assert_eq!(budget.load(Ordering::Acquire), 1 - granted);
+        // Each thread demands 2 tokens; combined demand (4) exceeds supply (2).
+        let t1 =
+            loom::thread::spawn(move || u32::from(a.try_acquire(1)) + u32::from(a.try_acquire(1)));
+        let t2 =
+            loom::thread::spawn(move || u32::from(b.try_acquire(1)) + u32::from(b.try_acquire(1)));
+
+        let granted = t1.join().unwrap() + t2.join().unwrap();
+
+        // Never over-grant: the two tokens are never handed out more than twice.
+        // Never lose a token: with demand exceeding supply, both are handed out.
+        assert_eq!(granted, 2, "expected exactly 2 grants, got {granted}");
+        assert_eq!(bucket.available(), 0);
     });
 }
