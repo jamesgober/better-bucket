@@ -306,7 +306,7 @@ pull in the rest of the family.
 <br>
 
 <div align="center">
-    <img width="180px" height="auto" alt="rust bucket" src="./_assets/bucket.png">
+    <a href="./docs/DESIGN.md" title="A well designed bucket!"><img width="180px" height="auto" alt="rust bucket" src="./_assets/bucket.png"></a>
     <br>
     <sup>BETTER <b>RUST</b> BUCKET</sup>
 </div>
