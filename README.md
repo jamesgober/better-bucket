@@ -269,19 +269,26 @@ better-bucket = { version = "0.9", default-features = false }
 ## Testing
 
 ```bash
-# Unit + integration + property tests
-cargo test --all-features
+# Unit + integration + property tests (default features = std + clock)
+cargo test
+cargo test --no-default-features            # no_std build
 
 # Concurrency model checking (no over-grant under interleaving)
 RUSTFLAGS="--cfg loom" cargo test --test loom_acquire
 
-# Benchmarks
+# Benchmarks (add --features comparison for the governor head-to-head)
 cargo bench --bench bucket_bench
 
-# Format + lints (must be clean)
+# Format, lints, docs, and the security gates (all must be clean)
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+cargo deny check
+cargo audit
 ```
+
+The `comparison` feature is benchmark-only — it pulls in `governor` for the
+head-to-head and is intentionally excluded from the default build and CI.
 
 <br>
 
@@ -316,6 +323,17 @@ pull in the rest of the family.
 
 Behavior is identical across all three; the CI matrix runs every target on
 stable and MSRV. A commit that breaks any platform is a broken commit.
+
+<br>
+
+## Documentation
+
+- [**API Reference**](./docs/API.md) — every public item, parameters, examples.
+- [**Design**](./docs/DESIGN.md) — the packed-atomic core, the fixed-point
+  refill, the wrapping clock, and how the no-over-grant contract is defended.
+- [**Benchmarks**](./docs/BENCHMARKS.md) — numbers, method, and the `governor`
+  comparison.
+- [**CHANGELOG**](./CHANGELOG.md) — per-release detail.
 
 <br>
 

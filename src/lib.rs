@@ -16,7 +16,7 @@
 //!
 //! ## Status
 //!
-//! Pre-1.0 (beta), hardened, **API frozen** until `1.0`: the lock-free
+//! Pre-1.0 (release candidate), hardened, **API frozen** until `1.0`: the lock-free
 //! [`Bucket`], the Tier-2 [`BucketBuilder`], [`BucketConfig`], [`Decision`],
 //! [`BucketError`], and the [`TokenBucket`] trait. The surface is validated
 //! against the first-consumer pattern (trait-based checks, injected shared

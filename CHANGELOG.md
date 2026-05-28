@@ -22,6 +22,31 @@
 
 ---
 
+## [0.9.5] - 2026-05-28
+
+Release candidate. Documentation polish only — no code or API change. The
+`0.9.1`–`0.9.4` bug-fix slots went unused; none were needed.
+
+### Added
+
+- `docs/DESIGN.md` — the architecture and design-decision reference: the packed
+  `AtomicU64` layout and why tokens are stored in millitokens, the CAS acquire
+  loop and its `Relaxed` ordering, the division-free `Q22` fixed-point refill,
+  the wrapping millisecond clock, overflow safety, how the no-over-grant contract
+  is defended, the clock as the performance floor, and the recorded design
+  decisions (token-bucket-only, plain `u32`, no keyed store, zero `unsafe`, no
+  SIMD).
+- A `Documentation` section in the README linking the API reference, design doc,
+  benchmarks, and changelog.
+
+### Changed
+
+- README testing commands aligned with CI (default features rather than
+  `--all-features`, plus the `no_std`, doc, and security-gate commands), with a
+  note that the `comparison` feature is benchmark-only.
+
+---
+
 ## [0.9.0] - 2026-05-28
 
 Beta. Broader testing and final benchmark numbers; no bug fixes were needed and
@@ -337,7 +362,8 @@ implementation will be built on.
 - Libraries do not commit `Cargo.lock` (per portfolio convention); it is
   gitignored.
 
-[Unreleased]: https://github.com/jamesgober/better-bucket/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/jamesgober/better-bucket/compare/v0.9.5...HEAD
+[0.9.5]: https://github.com/jamesgober/better-bucket/compare/v0.9.0...v0.9.5
 [0.9.0]: https://github.com/jamesgober/better-bucket/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/better-bucket/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/better-bucket/compare/v0.6.0...v0.7.0
