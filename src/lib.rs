@@ -16,7 +16,7 @@
 //!
 //! ## Status
 //!
-//! Pre-1.0 (alpha), hardened, **API frozen** until `1.0`: the lock-free
+//! Pre-1.0 (beta), hardened, **API frozen** until `1.0`: the lock-free
 //! [`Bucket`], the Tier-2 [`BucketBuilder`], [`BucketConfig`], [`Decision`],
 //! [`BucketError`], and the [`TokenBucket`] trait. The surface is validated
 //! against the first-consumer pattern (trait-based checks, injected shared
@@ -128,7 +128,7 @@ pub use crate::error::BucketError;
 /// ```
 /// // Reports the current 0.x series and carries a major.minor.patch core.
 /// let version = better_bucket::VERSION;
-/// assert!(version.starts_with("0.8"));
+/// assert!(version.starts_with("0.9"));
 /// assert_eq!(version.split('.').count(), 3);
 /// ```
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

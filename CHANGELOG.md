@@ -22,6 +22,29 @@
 
 ---
 
+## [0.9.0] - 2026-05-28
+
+Beta. Broader testing and final benchmark numbers; no bug fixes were needed and
+no API changed.
+
+### Added
+
+- A property test, `retry_after_is_an_honest_lower_bound`: after a denial,
+  waiting exactly the reported `retry_after` always makes the same request
+  succeed. This exercises the fixed-point `time_for` ceiling against the
+  fixed-point refill floor across the input space, confirming the two agree so
+  the retry hint never under-promises.
+
+### Notes
+
+- Benchmark numbers re-confirmed after the `0.7` wrap change and recorded as the
+  stable beta baseline in `docs/BENCHMARKS.md`; no regression against `0.6`.
+- No outstanding bugs. `0.9.1`–`0.9.4` are reserved for bug fixes should any
+  surface; `0.9.5`+ is the release-candidate band (critical fixes and doc polish
+  only) ahead of `1.0.0`.
+
+---
+
 ## [0.8.0] - 2026-05-27
 
 Alpha. The public surface is validated against the first-consumer pattern; no
@@ -314,7 +337,8 @@ implementation will be built on.
 - Libraries do not commit `Cargo.lock` (per portfolio convention); it is
   gitignored.
 
-[Unreleased]: https://github.com/jamesgober/better-bucket/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/jamesgober/better-bucket/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/jamesgober/better-bucket/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/better-bucket/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/better-bucket/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/better-bucket/compare/v0.5.0...v0.6.0

@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use better_bucket::Bucket;
+use better_bucket::{Bucket, Decision};
 use clock_lib::ManualClock;
 use proptest::prelude::*;
 
@@ -81,5 +81,30 @@ proptest! {
         let accrued = (u128::from(rate) * u128::from(elapsed_ms)).div_ceil(1_000);
         let ceiling = u128::from(rate) + accrued;
         prop_assert!(u128::from(granted) <= ceiling);
+    }
+
+    /// The retry hint is honest: after a denial, waiting exactly the reported
+    /// `retry_after` must make the same request succeed. This exercises the
+    /// fixed-point `time_for` ceiling against the fixed-point refill floor — the
+    /// two must agree so the hint never under-promises.
+    #[test]
+    fn retry_after_is_an_honest_lower_bound(
+        rate in 1u32..=10_000,
+        take in 1u32..=10_000,
+    ) {
+        prop_assume!(take <= rate); // n <= capacity, so it is grantable in principle
+
+        let clock = Arc::new(ManualClock::new());
+        let bucket = Bucket::per_second(rate).with_clock(Arc::clone(&clock));
+
+        prop_assert!(bucket.try_acquire(rate)); // drain to empty
+        if let Decision::Denied { retry_after } = bucket.acquire(take) {
+            prop_assume!(retry_after != Duration::MAX);
+            clock.advance(retry_after);
+            prop_assert!(
+                bucket.try_acquire(take),
+                "retry_after under-promised: rate={rate}, take={take}, waited {retry_after:?}"
+            );
+        }
     }
 }

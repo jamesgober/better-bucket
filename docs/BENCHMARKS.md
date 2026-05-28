@@ -46,6 +46,14 @@ bucket's own accounting (`algorithm_only`, with a cheap clock) is **~6 ns**, and
 contended throughput scales with threads because the lock-free CAS has no lock
 to serialize on.
 
+> **Re-confirmed at the `0.9` beta.** A re-run after the `0.7` wrap change held
+> or improved every repeatable metric (single-thread ~21–24 ns, algorithm-only
+> ~5.6–6.2 ns, refill-after-idle ~4.0–4.7 ns across runs) — no regression. The
+> contended figures are the one exception: on a non-isolated host they swing
+> widely run-to-run (the bench takes the slowest thread's time, so a single
+> descheduled thread dominates), so read them as evidence of lock-free scaling,
+> not as precise per-operation constants.
+
 ## Head-to-head vs `governor`
 
 Single-thread, allow path, same machine. The fair comparison is on the same

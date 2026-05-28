@@ -67,10 +67,10 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-better-bucket = "0.8"
+better-bucket = "0.9"
 
 # no_std build (no clock-lib; exposes only VERSION today — see Feature Flags):
-better-bucket = { version = "0.8", default-features = false }
+better-bucket = { version = "0.9", default-features = false }
 ```
 
 <hr>
@@ -254,7 +254,7 @@ cargo bench --features comparison           # + the governor comparison
 
 ```toml
 # no_std build (no clock-lib):
-better-bucket = { version = "0.8", default-features = false }
+better-bucket = { version = "0.9", default-features = false }
 ```
 
 > The lock-free accounting core uses only `core` atomics and is `no_std`-capable
