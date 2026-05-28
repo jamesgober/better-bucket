@@ -3,10 +3,10 @@
 > Complete reference for every public item in `better-bucket`, with examples.
 > Format mirrors the portfolio standard ([metrics-lib API.md](https://github.com/jamesgober/metrics-lib/blob/main/docs/API.md)).
 >
-> **Status: pre-1.0.** The `0.3` release ships the lock-free core (a single
-> `compare_exchange_weak` on a packed atomic word, allocation-free) behind the
-> public surface documented below — unchanged from the `0.2` foundation.
-> Items marked _(planned)_ are not yet shipped.
+> **Status: pre-1.0, API frozen.** The surface documented below is complete and
+> frozen until `1.0` (lock-free core in `0.3`, builder + feature freeze in `0.5`,
+> optimization in `0.6`). `try_acquire` is a single `compare_exchange_weak` on a
+> packed atomic word, allocation-free, with a division-free fixed-point refill.
 
 ## Table of Contents
 
@@ -41,7 +41,7 @@
 
 ```toml
 [dependencies]
-better-bucket = "0.5"
+better-bucket = "0.6"
 ```
 
 `no_std` build (exposes only [`VERSION`](#version); the `Bucket` surface needs
@@ -49,7 +49,7 @@ the default `clock` feature, which implies `std`):
 
 ```toml
 [dependencies]
-better-bucket = { version = "0.5", default-features = false }
+better-bucket = { version = "0.6", default-features = false }
 ```
 
 MSRV is **1.85** (Rust 2024 edition).

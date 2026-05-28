@@ -79,10 +79,10 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-better-bucket = "0.5"
+better-bucket = "0.6"
 
 # no_std build (no clock-lib; exposes only VERSION today — see Feature Flags):
-better-bucket = { version = "0.5", default-features = false }
+better-bucket = { version = "0.6", default-features = false }
 ```
 
 <hr>
@@ -230,23 +230,29 @@ bucket was created. Two consequences follow from that budget:
 <hr>
 <br>
 
-## Performance
+The acquire path is division-free: the refill rate is precomputed at
+construction, so the hot path is one packed-word load, a multiply-and-shift, and
+a CAS. On a Ryzen 9 9950X3D the bucket's own accounting measures **~6 ns**
+(isolated with a mock clock). A real `try_acquire` adds one monotonic clock read
+on top — the dominant cost — for a single-thread figure of **~24 ns**, most of
+it the `Instant::now()` call rather than the bucket. Contended throughput scales
+with threads; the lock-free CAS has no lock to serialize on.
 
-The bucket's own accounting — the packed-word load, the saturating refill math,
-and the CAS — measures at **~4 ns** on a Ryzen 9 9950X3D (isolated with a mock
-clock). A real `try_acquire` adds one monotonic clock read on top, which is the
-dominant cost in production: the single-thread figure is **~26 ns**, most of it
-the `Instant::now()` call rather than the bucket. Contended throughput scales
-with threads — there is no lock to serialize on. Full numbers, method, and
-machine details are in [`docs/BENCHMARKS.md`](./docs/BENCHMARKS.md).
+### vs `governor`
+
+On the **same monotonic clock**, `better-bucket` and `governor` are tied
+(~24 vs ~23 ns, both bounded by the clock read). The bucket's *algorithm* is at
+least as lean — with a cheap clock it runs in ~6 ns, edging `governor` on its
+fast `quanta` clock (~7 ns). Out of the box, `governor` is faster end-to-end
+(~7 ns) purely because its default `quanta` clock beats the `Instant` clock
+`better-bucket` reads through `clock-lib` — a clock difference, not an algorithm
+one. Full numbers, method, and machine details are in
+[`docs/BENCHMARKS.md`](./docs/BENCHMARKS.md).
 
 ```bash
-cargo bench --bench bucket_bench
+cargo bench --bench bucket_bench            # better-bucket baselines
+cargo bench --features comparison           # + the governor comparison
 ```
-
-These are the `0.5` baselines. The head-to-head comparison against `governor`
-ships with the optimization milestone (`0.6`), recorded honestly — including any
-case not won.
 
 <hr>
 <br>
@@ -260,7 +266,7 @@ case not won.
 
 ```toml
 # no_std build (no clock-lib):
-better-bucket = { version = "0.5", default-features = false }
+better-bucket = { version = "0.6", default-features = false }
 ```
 
 > The lock-free accounting core uses only `core` atomics and is `no_std`-capable

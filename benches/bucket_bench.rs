@@ -17,10 +17,27 @@ use criterion::{Criterion, criterion_group, criterion_main};
 
 /// Single-thread `try_acquire` on a held bucket. Capacity is large and the
 /// bucket is reset when it drains, so the measurement is dominated by the
-/// granting CAS path rather than the deny path.
+/// granting CAS path rather than the deny path. Uses the real `SystemClock`, so
+/// this figure includes one `Instant::now()` read per call.
 fn bench_single_thread(c: &mut Criterion) {
     let bucket = Bucket::per_second(1_000_000);
     let _ = c.bench_function("try_acquire/single_thread", |b| {
+        b.iter(|| {
+            if !bucket.try_acquire(black_box(1)) {
+                bucket.reset();
+            }
+        });
+    });
+}
+
+/// The bucket's own work, isolated from the clock: a `ManualClock` (a cheap
+/// atomic load, not a syscall) means this measures the packed-word load, the
+/// fixed-point refill, and the CAS — without the `Instant::now()` cost that
+/// dominates `single_thread`.
+fn bench_algorithm_only(c: &mut Criterion) {
+    let clock = Arc::new(ManualClock::new());
+    let bucket = Bucket::per_second(1_000_000).with_clock(Arc::clone(&clock));
+    let _ = c.bench_function("try_acquire/algorithm_only", |b| {
         b.iter(|| {
             if !bucket.try_acquire(black_box(1)) {
                 bucket.reset();
@@ -82,6 +99,7 @@ fn bench_refill_after_idle(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_single_thread,
+    bench_algorithm_only,
     bench_contended,
     bench_refill_after_idle
 );

@@ -16,16 +16,15 @@
 //!
 //! ## Status
 //!
-//! Pre-1.0, under active development. The `0.5` release is **feature complete**
-//! and the public API is **frozen** until `1.0`: the lock-free [`Bucket`], the
-//! Tier-2 [`BucketBuilder`], [`BucketConfig`], [`Decision`], [`BucketError`],
-//! and the [`TokenBucket`] trait. `try_acquire` is a single
-//! `compare_exchange_weak` on a packed atomic word — allocation-free, cache-line
-//! aligned — with lazy refill from the monotonic clock. The no-over-grant
-//! invariant is defended by `loom` model checking, a multi-thread stress test,
-//! an allocation audit, and `proptest`. Remaining `0.x` work is optimization,
-//! hardening, and the comparative benchmark; see `docs/BENCHMARKS.md` for the
-//! baseline numbers.
+//! Pre-1.0, under active development. The API is **frozen** until `1.0`: the
+//! lock-free [`Bucket`], the Tier-2 [`BucketBuilder`], [`BucketConfig`],
+//! [`Decision`], [`BucketError`], and the [`TokenBucket`] trait. `try_acquire`
+//! is a single `compare_exchange_weak` on a packed atomic word —
+//! allocation-free, cache-line aligned, with a division-free fixed-point refill
+//! — and the no-over-grant invariant is defended by `loom`, a stress test, an
+//! allocation audit, and `proptest`. The bucket's own accounting measures around
+//! six nanoseconds; end-to-end `try_acquire` is bounded by the monotonic clock
+//! read. See `docs/BENCHMARKS.md` for numbers and the `governor` comparison.
 //!
 //! Token bucket is the crate's sole algorithm by design — leaky-bucket and
 //! sliding-window limiting live in the downstream `rate-net` crate.
@@ -126,7 +125,7 @@ pub use crate::error::BucketError;
 /// ```
 /// // Reports the current 0.x series and carries a major.minor.patch core.
 /// let version = better_bucket::VERSION;
-/// assert!(version.starts_with("0.5"));
+/// assert!(version.starts_with("0.6"));
 /// assert_eq!(version.split('.').count(), 3);
 /// ```
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

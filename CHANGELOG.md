@@ -22,6 +22,47 @@
 
 ---
 
+## [0.6.0] - 2026-05-27
+
+Optimization. The acquire path is faster and division-free; the comparative
+benchmark against `governor` is recorded. No API changes.
+
+### Changed
+
+- The per-acquire refill no longer divides. The refill rate is precomputed once
+  at construction as a `Q22` fixed-point millitokens-per-millisecond multiplier,
+  so the hot path is a multiply and a shift; an early return skips it entirely
+  when no whole millisecond has elapsed since the last refill (the common case
+  under bursty load). Single-thread `try_acquire` is ~9% faster than `0.5`
+  (26.5 → 24.1 ns); the bucket's own accounting measures ~6 ns.
+- CI tests the default feature set (`std` + `clock`) and the `no_std` build
+  explicitly rather than `--all-features`, and `docs.rs` builds `std` + `clock`,
+  so the benchmark-only `governor` dependency never enters CI, MSRV, or docs
+  builds.
+
+### Added
+
+- `benches/comparison.rs` and a benchmark-only `comparison` feature (pulls
+  `governor`): the head-to-head measured on the same monotonic clock, plus
+  `governor`'s default `quanta`-clock configuration.
+- An `algorithm_only` benchmark that isolates the bucket's work from the clock
+  read using a `ManualClock`.
+- `docs/BENCHMARKS.md` rewritten with the `0.6` numbers and an honest `governor`
+  comparison: tied on the same `Instant` clock, the bucket's algorithm at least
+  as lean as `governor`'s, and `governor` faster out-of-the-box purely because
+  its default `quanta` clock beats `clock-lib`'s `Instant` read.
+
+### Notes
+
+- **No SIMD / no batched acquire.** A single-bucket acquire is one CAS on one
+  word — no lane-parallelism to exploit, and no consumer needs batched
+  multi-bucket acquire. Declined per the "evaluate, don't force" rule.
+- The end-to-end latency is bounded by the monotonic clock, not the bucket.
+  Matching `governor` out-of-the-box would need a faster monotonic source from
+  `clock-lib`; recorded as a future cross-crate improvement.
+
+---
+
 ## [0.5.0] - 2026-05-27
 
 Feature complete. The public API is **frozen** until 1.0 — only additive,
@@ -194,7 +235,8 @@ implementation will be built on.
 - Libraries do not commit `Cargo.lock` (per portfolio convention); it is
   gitignored.
 
-[Unreleased]: https://github.com/jamesgober/better-bucket/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/jamesgober/better-bucket/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/jamesgober/better-bucket/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/better-bucket/compare/v0.3.0...v0.5.0
 [0.3.0]: https://github.com/jamesgober/better-bucket/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/better-bucket/compare/v0.1.0...v0.2.0

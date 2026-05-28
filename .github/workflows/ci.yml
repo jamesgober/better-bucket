@@ -28,14 +28,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all -- --check
+      # Default features (std + clock) are the full functional surface. The
+      # `comparison` feature is benchmark-only — it pulls in `governor` and is
+      # intentionally excluded from CI; it is exercised manually via
+      # `cargo bench --features comparison`.
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
       - name: Test
-        run: cargo test --all-features
+        run: cargo test
       - name: Test (no_std)
         run: cargo test --no-default-features
       - name: Doc
-        run: cargo doc --no-deps --all-features
+        run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
 

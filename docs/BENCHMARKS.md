@@ -1,21 +1,23 @@
 # better-bucket — Benchmarks
 
-Baseline numbers for the lock-free acquire path, recorded at the `0.5.0` feature
-freeze. These establish the regression baseline the rest of the `0.x` series is
-measured against; the head-to-head comparison with `governor` (and other
-incumbents) lands with the optimization milestone in `0.6.0`.
+Numbers for the lock-free acquire path, including the head-to-head against
+`governor`. Recorded at `0.6.0` (the optimization milestone).
 
-> Numbers are honest baselines, not marketing. They were taken once on the
-> machine below; treat them as order-of-magnitude, and re-run locally
-> (`cargo bench --bench bucket_bench`) before drawing conclusions on your own
-> hardware.
+> Honest baselines, not marketing. Taken on the machine below; treat as
+> order-of-magnitude and re-run locally before drawing conclusions on your own
+> hardware. The comparison run needs the bench-only feature:
+> `cargo bench --features comparison`.
 
 ## Method
 
 - Harness: [`criterion`](https://crates.io/crates/criterion) 0.5, 100 samples
   per benchmark after a 3-second warm-up.
-- Source: [`benches/bucket_bench.rs`](../benches/bucket_bench.rs).
+- Source: [`benches/bucket_bench.rs`](../benches/bucket_bench.rs) and
+  [`benches/comparison.rs`](../benches/comparison.rs).
 - Reported as `[low  median  high]` from criterion's estimate.
+- The `single_thread` benchmark uses the real `SystemClock`, so it includes one
+  `Instant::now()` per call. `algorithm_only` uses a `ManualClock` (a cheap
+  atomic load) to isolate the bucket's own work from the clock.
 
 ## Environment
 
@@ -25,40 +27,65 @@ incumbents) lands with the optimization milestone in `0.6.0`.
 | OS | Linux 6.6 (WSL2, Ubuntu) |
 | Toolchain | rustc 1.95.0, release profile (`lto = "fat"`, `codegen-units = 1`) |
 
-## Results
+## better-bucket
 
 | Benchmark | low | median | high |
 |---|---|---|---|
-| `try_acquire` — single thread | 26.24 ns | **26.54 ns** | 26.81 ns |
-| `try_acquire` — contended, 2 threads | 16.56 ns | **16.82 ns** | 17.16 ns |
-| `try_acquire` — contended, 4 threads | 10.06 ns | **10.37 ns** | 10.73 ns |
-| `try_acquire` — contended, 8 threads | 9.19 ns | **9.59 ns** | 10.13 ns |
-| `available` — refill after long idle | 4.17 ns | **4.19 ns** | 4.22 ns |
+| `try_acquire` — single thread (real clock) | 23.86 ns | **24.14 ns** | 24.43 ns |
+| `try_acquire` — algorithm only (mock clock) | 6.18 ns | **6.21 ns** | 6.25 ns |
+| `try_acquire` — contended, 2 threads | 11.70 ns | **11.90 ns** | 12.22 ns |
+| `try_acquire` — contended, 4 threads | 6.84 ns | **6.96 ns** | 7.10 ns |
+| `try_acquire` — contended, 8 threads | 4.26 ns | **4.39 ns** | 4.53 ns |
+| `available` — refill after long idle | 4.67 ns | **4.70 ns** | 4.73 ns |
 
-## Reading the numbers
+The single-thread figure improved ~9% over the `0.5` baseline (26.5 → 24.1 ns)
+after the `0.6` optimization: the per-acquire `u128` division was replaced by a
+precomputed fixed-point multiply-and-shift, with an early return when no whole
+millisecond has elapsed. The dominant cost is the `Instant::now()` read — the
+bucket's own accounting (`algorithm_only`, with a cheap clock) is **~6 ns**, and
+contended throughput scales with threads because the lock-free CAS has no lock
+to serialize on.
 
-- **The monotonic clock read dominates the single-thread figure.** The
-  single-thread benchmark uses the real `SystemClock`, so every `try_acquire`
-  pays for one `Instant::now()` — on the order of ~20 ns on this platform. The
-  `refill_after_idle` benchmark uses a `ManualClock` (a cheap atomic load), which
-  isolates the bucket's own work — the packed-word load, the saturating refill
-  math, and the CAS — at **~4 ns**. In other words, the accounting itself is a
-  handful of nanoseconds; the dominant cost in production is whatever the
-  injected clock costs to read.
-- **Contended per-operation time falls as threads are added**, because the
-  contended benchmark reports per-operation wall time across a fixed total of
-  acquires: more threads complete more work per wall-second. The lock-free CAS
-  loop scales without a lock to serialize on; there is no single-writer
-  bottleneck to collapse under load.
-- **Refill after a long idle is constant-time** — it is one subtraction, one
-  multiply/divide, and a clamp, regardless of how much time elapsed.
+## Head-to-head vs `governor`
+
+Single-thread, allow path, same machine. The fair comparison is on the same
+clock; `governor`'s default clock (`quanta`, a TSC-calibrated read) is faster
+than the `Instant` clock `clock-lib` provides, so its out-of-the-box number is
+also shown.
+
+| Limiter | clock | low | median | high |
+|---|---|---|---|---|
+| `better-bucket` | `Instant` (clock-lib) | 23.84 ns | **24.02 ns** | 24.20 ns |
+| `governor` | `Instant` (monotonic) | 23.09 ns | **23.17 ns** | 23.26 ns |
+| `governor` | `quanta` (default) | 7.04 ns | **7.07 ns** | 7.11 ns |
+
+### What this says, honestly
+
+- **On the same `Instant` clock, the two are tied** — 24.0 vs 23.2 ns, within a
+  nanosecond, both dominated by the ~20 ns clock read. `better-bucket` does not
+  measurably beat `governor` here.
+- **The bucket's algorithm is at least as lean.** `better-bucket` with a cheap
+  clock (`algorithm_only`, ~6.2 ns) edges `governor` on its fast `quanta` clock
+  (~7.07 ns). The token-bucket accounting is not the bottleneck.
+- **Out of the box, `governor` is faster end-to-end** (7 ns vs 24 ns), entirely
+  because its default `quanta` clock is faster than the `Instant` clock
+  `better-bucket` reads through `clock-lib`. This is a clock difference, not an
+  algorithm difference.
+
+### Consequence
+
+`better-bucket`'s end-to-end latency is bounded by the monotonic clock, not its
+own code. Closing the out-of-the-box gap with `governor` requires a faster
+monotonic source (e.g. a TSC-based reading) from `clock-lib`; that is a
+`clock-lib` improvement, noted for a future cross-crate change rather than worked
+around here. The bucket itself is already at the few-nanosecond floor.
 
 ## Caveats
 
-- A single run on one machine. Variance between runs is a few percent.
-- WSL2 is not bare metal; absolute numbers on native Linux or other CPUs will
-  differ. The *shape* (clock-read-dominated single thread, scalable contention,
-  constant refill) is what matters here.
-- The comparative benchmark against `governor` — the number that has to justify
-  the crate's name — is deferred to `0.6.0`, where it will be committed
-  alongside method and any case that does not win.
+- Single runs on one machine; sub-nanosecond differences are within variance.
+- WSL2 is not bare metal — absolute numbers on native Linux or other CPUs will
+  differ. The shape (clock-dominated end-to-end, ~6 ns algorithm, scalable
+  contention, tied-with-`governor` on the same clock) is the takeaway.
+- The contended benchmark reports per-thread time after a barrier (it excludes
+  thread spawn/join), refined from the `0.5` methodology; the contended figures
+  are not directly comparable across those two releases.

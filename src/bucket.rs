@@ -36,6 +36,11 @@ use crate::decision::Decision;
 /// Millitokens per whole token.
 const MILLI: u64 = 1_000;
 
+/// Fractional bits for the precomputed refill rate. The rate is stored as
+/// millitokens-per-millisecond in `Q(REFILL_FRAC_BITS)` fixed point so the hot
+/// path is a multiply and a shift — no division per acquire.
+const REFILL_FRAC_BITS: u32 = 22;
+
 /// Packs `millitokens` (clamped to 32 bits) and `last_ms` into one word.
 #[inline]
 fn pack(millitokens: u64, last_ms: u32) -> u64 {
@@ -102,13 +107,11 @@ pub struct Bucket<C: Clock = SystemClock> {
     state: AtomicU64,
     /// Capacity in millitokens, already clamped to the 32-bit packing ceiling.
     capacity_millitokens: u64,
-    /// Refill numerator: `refill_amount * 1_000_000_000`. Zero means no refill.
-    /// Paired with `period_nanos`, `elapsed_ms * refill_numerator / period_nanos`
-    /// yields the millitokens accrued — exact integer math that keeps
-    /// sub-millisecond periods working despite the millisecond tick.
-    refill_numerator: u64,
-    /// Refill period in nanoseconds. Zero means no refill.
-    period_nanos: u64,
+    /// Refill rate as millitokens-per-millisecond in `Q(REFILL_FRAC_BITS)` fixed
+    /// point. Derived once from `refill_amount` and the period in nanoseconds, so
+    /// the hot path needs only a multiply and a shift and sub-millisecond periods
+    /// stay accurate. Zero means no refill.
+    refill_per_ms_q: u128,
     /// The monotonic anchor that `last_ms` is measured from.
     created_at: Monotonic,
     /// The original configuration, kept for [`config`](Self::config).
@@ -124,22 +127,25 @@ fn build<C: Clock>(config: BucketConfig, clock: C) -> Bucket<C> {
     let capacity_millitokens = u64::from(config.capacity())
         .saturating_mul(MILLI)
         .min(u64::from(u32::MAX));
-    // `refill_amount * 1_000` millitokens accrue per `refill_period`; scaling by
-    // a further 1_000_000 lets us divide by the period in *nanoseconds*, which
-    // keeps sub-millisecond periods exact. `0` disables refill.
-    let (refill_numerator, period_nanos) = if config.refill_amount() == 0 {
-        (0, 0)
+    // Millitokens per millisecond = refill_amount * 1000 / period_ms
+    //                             = refill_amount * 1e9 / period_nanos,
+    // kept in Q(REFILL_FRAC_BITS) fixed point. Computing from nanoseconds keeps
+    // sub-millisecond periods accurate; the one division happens here, not on the
+    // acquire path. `0` disables refill.
+    let refill_per_ms_q = if config.refill_amount() == 0 || config.refill_period().is_zero() {
+        0
     } else {
-        let numerator = u64::from(config.refill_amount()).saturating_mul(1_000_000_000);
-        let period = u64::try_from(config.refill_period().as_nanos()).unwrap_or(u64::MAX);
-        (numerator, period)
+        let period_nanos = u64::try_from(config.refill_period().as_nanos())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let numerator = (u128::from(config.refill_amount()) * 1_000_000_000) << REFILL_FRAC_BITS;
+        numerator / u128::from(period_nanos)
     };
     let initial_millitokens = (u64::from(config.initial()) * MILLI).min(capacity_millitokens);
     Bucket {
         state: AtomicU64::new(pack(initial_millitokens, 0)),
         capacity_millitokens,
-        refill_numerator,
-        period_nanos,
+        refill_per_ms_q,
         created_at,
         config,
         clock,
@@ -376,15 +382,19 @@ impl<C: Clock> Bucket<C> {
 
     /// The millitoken count after refilling over `last_ms → now_ms`, capped at
     /// capacity. Saturating throughout: a huge elapsed gap fills to capacity, it
-    /// can never wrap or overflow.
+    /// can never wrap or overflow. When no whole millisecond has elapsed since
+    /// the last refill — the common case under bursty load — it returns
+    /// immediately, doing no arithmetic at all.
     #[inline]
     fn refilled(&self, tokens_mt: u64, last_ms: u32, now_ms: u32) -> u64 {
-        if self.refill_numerator == 0 || self.period_nanos == 0 {
+        if self.refill_per_ms_q == 0 {
             return tokens_mt;
         }
-        let elapsed_ms = u64::from(now_ms.saturating_sub(last_ms));
-        let added = u128::from(elapsed_ms).saturating_mul(u128::from(self.refill_numerator))
-            / u128::from(self.period_nanos);
+        let elapsed_ms = now_ms.saturating_sub(last_ms);
+        if elapsed_ms == 0 {
+            return tokens_mt;
+        }
+        let added = u128::from(elapsed_ms).saturating_mul(self.refill_per_ms_q) >> REFILL_FRAC_BITS;
         let added_mt = u64::try_from(added).unwrap_or(u64::MAX);
         tokens_mt
             .saturating_add(added_mt)
@@ -394,16 +404,17 @@ impl<C: Clock> Bucket<C> {
     /// The minimum time for `deficit_mt` millitokens to accrue, rounded up.
     /// [`Duration::MAX`] if the bucket never refills.
     fn time_for(&self, deficit_mt: u64) -> Duration {
-        if self.refill_numerator == 0 || self.period_nanos == 0 {
+        if self.refill_per_ms_q == 0 {
             return Duration::MAX;
         }
-        let numerator = u128::from(deficit_mt)
-            .saturating_mul(u128::from(self.period_nanos))
-            .saturating_add(u128::from(self.refill_numerator) - 1);
-        let millis = numerator / u128::from(self.refill_numerator);
+        // ms = ceil(deficit_mt / rate_per_ms) = ceil((deficit_mt << FRAC) / q).
+        let numerator =
+            (u128::from(deficit_mt) << REFILL_FRAC_BITS).saturating_add(self.refill_per_ms_q - 1);
+        let millis = numerator / self.refill_per_ms_q;
         Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX))
     }
 
+    #[inline]
     fn acquire_inner(&self, n: u32) -> Decision {
         if n == 0 {
             // Zero tokens are always available, even from an empty bucket.

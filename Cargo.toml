@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "better-bucket"
-version = "0.5.0"
+version = "0.6.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -51,7 +51,10 @@ authors = [
 ]
 
 [package.metadata.docs.rs]
-all-features = true
+# The full functional surface is the default features (std + clock); the
+# `comparison` feature is benchmark-only and must not pull `governor` into the
+# docs build.
+features = ["std", "clock"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [lib]
@@ -92,6 +95,11 @@ std = ["clock-lib?/std"]
 # lands in 0.3.0 and lifts the std requirement from the caller-driven path.
 clock = ["std", "dep:clock-lib", "dep:error-forge"]
 
+# Benchmark-only: pulls in `governor` for the comparative benchmark
+# (`cargo bench --features comparison --bench comparison`). Never enabled in a
+# normal build, so it does not affect the crate's dependency footprint or MSRV.
+comparison = ["clock", "dep:governor"]
+
 
 
 # DEPENDENCIES
@@ -106,6 +114,10 @@ clock-lib = { version = "1.0", optional = true, default-features = false }
 # of thiserror/anyhow in a library crate. Only the `ForgeError` trait is used;
 # `BucketError` is hand-written so every variant is documented.
 error-forge = { version = "1.0", optional = true }
+
+# Benchmark-only incumbent, behind the `comparison` feature. Used solely by the
+# `comparison` bench to produce the head-to-head numbers in docs/BENCHMARKS.md.
+governor = { version = "0.10", optional = true }
 
 
 
@@ -132,6 +144,12 @@ loom = "0.7"
 name              = "bucket_bench"
 harness           = false
 required-features = ["clock"]
+
+# Head-to-head vs `governor`. Only built with `--features comparison`.
+[[bench]]
+name              = "comparison"
+harness           = false
+required-features = ["comparison"]
 
 
 
