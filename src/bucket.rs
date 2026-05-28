@@ -589,6 +589,17 @@ mod tests {
     }
 
     #[test]
+    fn test_refill_after_long_idle_saturates_without_overflow() {
+        // A multi-year idle gap must fill to capacity, never wrap or overflow.
+        let (clock, bucket) = manual_bucket(1_000);
+        assert!(bucket.try_acquire(1_000));
+        clock.advance(Duration::from_secs(60 * 60 * 24 * 365 * 5));
+        assert_eq!(bucket.available(), 1_000);
+        // And the bucket is still usable afterwards.
+        assert!(bucket.try_acquire(1_000));
+    }
+
+    #[test]
     fn test_denied_reports_retry_after() {
         let (_clock, bucket) = manual_bucket(10);
         assert!(bucket.try_acquire(10)); // empty

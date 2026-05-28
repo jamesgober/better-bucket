@@ -22,6 +22,38 @@
 
 ---
 
+## [0.5.0] - 2026-05-27
+
+Feature complete. The public API is **frozen** until 1.0 — only additive,
+non-breaking changes from here.
+
+### Added
+
+- `BucketBuilder` and `Bucket::builder()` — the Tier-2 fluent configuration
+  path: `.capacity(..)`, `.refill(amount, period)`, `.initial(..)`, `.build()`.
+  `build` validates through `BucketConfig::new`, so an unworkable combination
+  is rejected; `initial` defaults to the capacity (start full). A custom clock
+  is injected by chaining `Bucket::with_clock` onto the built bucket.
+- `examples/` — `per_second` (Tier-1 limiter), `burst` (spike absorption with a
+  `ManualClock`), `deterministic_test` (sleep-free testing pattern), and
+  `builder` (Tier-2 configuration). Each declares `required-features = ["clock"]`.
+- `benches/bucket_bench.rs` rewritten to measure the real lock-free `Bucket`:
+  single-thread `try_acquire`, contended acquire across 2/4/8 threads, and the
+  refill computation after a long idle gap.
+- `docs/BENCHMARKS.md` — recorded baseline numbers with methodology and machine
+  details (the comparative benchmark against `governor` lands in `0.6.0`).
+- A refill-after-long-idle test asserting a multi-year gap saturates to
+  capacity without wrapping or overflowing.
+
+### Changed
+
+- Documented the design decision that **token bucket is this crate's sole
+  algorithm**; leaky-bucket and sliding-window limiting belong in `rate-net`.
+- The benchmark target now requires the `clock` feature; a bare `no_std` build
+  skips it (and the examples) rather than failing to compile.
+
+---
+
 ## [0.3.0] - 2026-05-27
 
 The lock-free core. The mutex-backed `0.2` internals are replaced by a single
@@ -162,7 +194,8 @@ implementation will be built on.
 - Libraries do not commit `Cargo.lock` (per portfolio convention); it is
   gitignored.
 
-[Unreleased]: https://github.com/jamesgober/better-bucket/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/better-bucket/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/jamesgober/better-bucket/compare/v0.3.0...v0.5.0
 [0.3.0]: https://github.com/jamesgober/better-bucket/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/better-bucket/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/better-bucket/releases/tag/v0.1.0

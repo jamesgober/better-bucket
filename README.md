@@ -79,10 +79,10 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-better-bucket = "0.3"
+better-bucket = "0.5"
 
 # no_std build (no clock-lib; exposes only VERSION today — see Feature Flags):
-better-bucket = { version = "0.3", default-features = false }
+better-bucket = { version = "0.5", default-features = false }
 ```
 
 <hr>
@@ -113,16 +113,19 @@ That is the whole common case. No builder, no type parameters, no setup.
 
 When you need control over capacity, refill rate, and initial fill independently
 — for example a large burst ceiling that refills slowly, or a bucket that starts
-empty — build a validated [`BucketConfig`] and hand it to `Bucket::from_config`:
+empty — use the builder:
 
 ```rust
-use better_bucket::{Bucket, BucketConfig};
+use better_bucket::Bucket;
 use std::time::Duration;
 
 // 500-token burst ceiling, refilling 100 tokens/second, starting empty.
-let config = BucketConfig::new(500, 100, Duration::from_secs(1), 0)
+let bucket = Bucket::builder()
+    .capacity(500)
+    .refill(100, Duration::from_secs(1))
+    .initial(0)
+    .build()
     .expect("valid configuration");
-let bucket = Bucket::from_config(config);
 
 // Try to take 10 tokens at once.
 if bucket.try_acquire(10) {
@@ -133,10 +136,11 @@ if bucket.try_acquire(10) {
 let left = bucket.available();
 ```
 
-`BucketConfig::new` rejects nonsensical configurations (zero capacity, zero
-refill amount, zero refill period) up front with a [`BucketError`], so an
-invalid bucket can never be constructed. A fluent `Bucket::builder()` is a
-planned Tier-2 convenience for `0.5.0`; the config path above is its foundation.
+`build()` validates the configuration (rejecting zero capacity, zero refill
+amount, or zero refill period with a [`BucketError`]), so an invalid bucket can
+never be constructed. For a custom time source, chain `.with_clock(...)` onto the
+built bucket. If you prefer to build the config value yourself, `BucketConfig::new`
+plus `Bucket::from_config` is the same path without the fluent surface.
 
 <hr>
 <br>
@@ -228,18 +232,21 @@ bucket was created. Two consequences follow from that budget:
 
 ## Performance
 
-The acquire path is designed to land in single-digit nanoseconds on a held
-bucket, competitive with or ahead of the established token-bucket crates.
-Benchmark numbers (single-thread `try_acquire`, contended multi-thread
-acquire, refill-after-idle) are produced by the Criterion suite:
+The bucket's own accounting — the packed-word load, the saturating refill math,
+and the CAS — measures at **~4 ns** on a Ryzen 9 9950X3D (isolated with a mock
+clock). A real `try_acquire` adds one monotonic clock read on top, which is the
+dominant cost in production: the single-thread figure is **~26 ns**, most of it
+the `Instant::now()` call rather than the bucket. Contended throughput scales
+with threads — there is no lock to serialize on. Full numbers, method, and
+machine details are in [`docs/BENCHMARKS.md`](./docs/BENCHMARKS.md).
 
 ```bash
 cargo bench --bench bucket_bench
 ```
 
-A head-to-head comparison against `governor` and `leaky-bucket` ships with the
-performance write-up as the suite matures toward 1.0. Numbers are recorded
-honestly, including any case not won.
+These are the `0.5` baselines. The head-to-head comparison against `governor`
+ships with the optimization milestone (`0.6`), recorded honestly — including any
+case not won.
 
 <hr>
 <br>
@@ -253,7 +260,7 @@ honestly, including any case not won.
 
 ```toml
 # no_std build (no clock-lib):
-better-bucket = { version = "0.3", default-features = false }
+better-bucket = { version = "0.5", default-features = false }
 ```
 
 > The lock-free accounting core uses only `core` atomics and is `no_std`-capable

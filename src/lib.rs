@@ -16,14 +16,19 @@
 //!
 //! ## Status
 //!
-//! Pre-1.0, under active development. The `0.3` release ships the **lock-free
-//! core**: [`Bucket::try_acquire`] is a single `compare_exchange_weak` on a
-//! packed atomic word, allocation-free, with lazy refill from the monotonic
-//! clock and cache-line alignment against false sharing. The public surface —
-//! [`Bucket`], [`BucketConfig`], [`Decision`], [`BucketError`], and the
-//! [`TokenBucket`] trait — is unchanged from the `0.2` foundation. The
-//! no-over-grant invariant is defended by `loom` model checking, a multi-thread
-//! stress test, and `proptest`.
+//! Pre-1.0, under active development. The `0.5` release is **feature complete**
+//! and the public API is **frozen** until `1.0`: the lock-free [`Bucket`], the
+//! Tier-2 [`BucketBuilder`], [`BucketConfig`], [`Decision`], [`BucketError`],
+//! and the [`TokenBucket`] trait. `try_acquire` is a single
+//! `compare_exchange_weak` on a packed atomic word — allocation-free, cache-line
+//! aligned — with lazy refill from the monotonic clock. The no-over-grant
+//! invariant is defended by `loom` model checking, a multi-thread stress test,
+//! an allocation audit, and `proptest`. Remaining `0.x` work is optimization,
+//! hardening, and the comparative benchmark; see `docs/BENCHMARKS.md` for the
+//! baseline numbers.
+//!
+//! Token bucket is the crate's sole algorithm by design — leaky-bucket and
+//! sliding-window limiting live in the downstream `rate-net` crate.
 //!
 //! ```
 //! # #[cfg(feature = "clock")] {
@@ -91,6 +96,8 @@
 #[cfg(feature = "clock")]
 mod bucket;
 #[cfg(feature = "clock")]
+mod builder;
+#[cfg(feature = "clock")]
 mod config;
 #[cfg(feature = "clock")]
 mod decision;
@@ -99,6 +106,8 @@ mod error;
 
 #[cfg(feature = "clock")]
 pub use crate::bucket::{Bucket, TokenBucket};
+#[cfg(feature = "clock")]
+pub use crate::builder::BucketBuilder;
 #[cfg(feature = "clock")]
 pub use crate::config::BucketConfig;
 #[cfg(feature = "clock")]
@@ -117,7 +126,7 @@ pub use crate::error::BucketError;
 /// ```
 /// // Reports the current 0.x series and carries a major.minor.patch core.
 /// let version = better_bucket::VERSION;
-/// assert!(version.starts_with("0.3"));
+/// assert!(version.starts_with("0.5"));
 /// assert_eq!(version.split('.').count(), 3);
 /// ```
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

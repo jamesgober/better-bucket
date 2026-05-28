@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "better-bucket"
-version = "0.3.0"
+version = "0.5.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -126,9 +126,33 @@ loom = "0.7"
 
 # BENCHMARKS
 # #################################
+# The bench exercises the real `Bucket`, so it needs the clock feature; under a
+# bare `no_std` build it is skipped rather than failing to compile.
 [[bench]]
-name    = "bucket_bench"
-harness = false
+name              = "bucket_bench"
+harness           = false
+required-features = ["clock"]
+
+
+
+# EXAMPLES
+# #################################
+# All examples drive a `Bucket` and so require the clock feature.
+[[example]]
+name              = "per_second"
+required-features = ["clock"]
+
+[[example]]
+name              = "burst"
+required-features = ["clock"]
+
+[[example]]
+name              = "deterministic_test"
+required-features = ["clock"]
+
+[[example]]
+name              = "builder"
+required-features = ["clock"]
 
 
 

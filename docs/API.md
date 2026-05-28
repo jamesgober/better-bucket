@@ -25,7 +25,7 @@
   - [`Bucket::from_config`](#bucketfrom_config)
   - [`Bucket::with_clock`](#bucketwith_clock)
   - [`Bucket::config`](#bucketconfig-method)
-  - [`Bucket::builder`](#bucketbuilder) _(planned: 0.5)_
+  - [`Bucket::builder` / `BucketBuilder`](#bucketbuilder)
 - [Tier 3 — the power path](#tier-3--the-power-path)
   - [`TokenBucket` trait](#tokenbucket-trait)
 - [Types](#types)
@@ -41,7 +41,7 @@
 
 ```toml
 [dependencies]
-better-bucket = "0.3"
+better-bucket = "0.5"
 ```
 
 `no_std` build (exposes only [`VERSION`](#version); the `Bucket` surface needs
@@ -49,7 +49,7 @@ the default `clock` feature, which implies `std`):
 
 ```toml
 [dependencies]
-better-bucket = { version = "0.3", default-features = false }
+better-bucket = { version = "0.5", default-features = false }
 ```
 
 MSRV is **1.85** (Rust 2024 edition).
@@ -473,12 +473,53 @@ let bucket = Bucket::per_second(10);
 assert_eq!(bucket.config().refill_period(), Duration::from_secs(1));
 ```
 
-### `Bucket::builder` _(planned: 0.5)_
+### `Bucket::builder`
 
-A fluent builder (`Bucket::builder().capacity(..).refill(..).initial(..).build()`)
-is planned for the `0.5` feature-complete release as a convenience over
-[`BucketConfig::new`](#bucketconfig). The config path is its foundation and is
-available now.
+```rust
+pub fn builder() -> BucketBuilder
+
+// BucketBuilder
+pub fn capacity(self, capacity: u32) -> BucketBuilder
+pub fn refill(self, amount: u32, period: Duration) -> BucketBuilder
+pub fn initial(self, initial: u32) -> BucketBuilder
+pub fn build(self) -> Result<Bucket<SystemClock>, BucketError>
+```
+
+The fluent Tier-2 entry point. Set the capacity (burst ceiling), the refill rate,
+and optionally the initial fill, then `build`. Anything unset keeps its default;
+`build` validates through [`BucketConfig::new`](#bucketconfig), so an unworkable
+combination is rejected. `initial` defaults to the capacity (the bucket starts
+full). For a custom clock, chain [`with_clock`](#bucketwith_clock) onto the built
+bucket — the builder always produces a `SystemClock` bucket.
+
+**`build` errors:** the same as [`BucketConfig::new`](#bucketconfig) —
+`ZeroCapacity`, `ZeroRefillAmount`, `ZeroRefillPeriod`. A freshly created builder
+fails this way until a capacity and refill rate are set.
+
+**Examples**
+
+```rust
+use better_bucket::Bucket;
+use std::time::Duration;
+
+// Large burst ceiling, slow refill, starting empty.
+let bucket = Bucket::builder()
+    .capacity(1000)
+    .refill(50, Duration::from_secs(1))
+    .initial(0)
+    .build()?;
+assert_eq!(bucket.capacity(), 1000);
+assert_eq!(bucket.available(), 0);
+# Ok::<(), better_bucket::BucketError>(())
+```
+
+An unconfigured builder is rejected:
+
+```rust
+use better_bucket::{Bucket, BucketError};
+
+assert_eq!(Bucket::builder().build().unwrap_err(), BucketError::ZeroCapacity);
+```
 
 ---
 
