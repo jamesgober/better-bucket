@@ -37,6 +37,15 @@ API friction was found, so nothing changed.
   config-then-inject-clock construction path. All four patterns read naturally
   and pass.
 
+### Fixed
+
+- The allocation audit (`tests/alloc.rs`) now counts allocations **per thread**
+  instead of process-wide, and warms every operation it measures. The global
+  counter could attribute incidental allocations made by the test harness or
+  runtime on other threads to the acquire path, which produced a spurious
+  failure on macOS/stable. The acquire path remains allocation-free; the test is
+  now robust across platforms.
+
 ### Notes
 
 - **No API change.** The frozen surface is consumable as-is; the trait plus

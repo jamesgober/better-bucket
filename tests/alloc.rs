@@ -1,8 +1,13 @@
 //! Allocation audit for the acquire path.
 //!
-//! The hot path must never allocate. This test installs a counting global
-//! allocator, warms the bucket up, then asserts that a long run of
-//! `try_acquire` / `acquire` / `available` calls performs zero allocations.
+//! The hot path must never allocate. This installs a global allocator that
+//! counts allocations **per thread**, warms every operation the measured loop
+//! uses, then asserts that a long steady-state run of `try_acquire` / `acquire`
+//! / `available` performs zero allocations *on the measuring thread*.
+//!
+//! Per-thread counting matters: a global counter would also catch incidental
+//! allocations made by the test harness or runtime on other threads, which has
+//! nothing to do with the bucket and varies by platform.
 //!
 //! Gated on `clock`: without it there is no `Bucket` to exercise.
 
@@ -10,44 +15,57 @@
 #![allow(clippy::unwrap_used)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use better_bucket::Bucket;
 use clock_lib::ManualClock;
 
-/// Counts allocations while delegating to the system allocator.
-struct Counting;
+thread_local! {
+    // `const` init uses native thread-local storage, so reading or incrementing
+    // it never allocates and cannot recurse into the allocator below.
+    static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+}
 
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+#[inline]
+fn note_alloc() {
+    ALLOCATIONS.with(|c| c.set(c.get() + 1));
+}
+
+fn alloc_count() -> u64 {
+    ALLOCATIONS.with(Cell::get)
+}
+
+/// Counts the current thread's allocations, delegating to the system allocator.
+struct Counting;
 
 // SAFETY: every method forwards directly to the system allocator with the same
 // arguments, so the allocator contract is upheld unchanged; the only added
-// behaviour is a relaxed counter increment, which has no bearing on soundness.
+// behaviour is a non-allocating per-thread counter increment.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        note_alloc();
         // SAFETY: `layout` is forwarded unchanged to the system allocator.
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: `ptr`/`layout` originate from `System.alloc` above and are
-        // forwarded unchanged.
+        // SAFETY: `ptr`/`layout` originate from `System.alloc` and are forwarded
+        // unchanged.
         unsafe { System.dealloc(ptr, layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        note_alloc();
         // SAFETY: `layout` is forwarded unchanged to the system allocator.
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: `ptr`/`layout`/`new_size` originate from and satisfy the
-        // system allocator's contract and are forwarded unchanged.
+        note_alloc();
+        // SAFETY: `ptr`/`layout`/`new_size` satisfy the system allocator's
+        // contract and are forwarded unchanged.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -57,16 +75,24 @@ static ALLOCATOR: Counting = Counting;
 
 #[test]
 fn test_acquire_path_does_not_allocate() {
-    // Build and warm up entirely before measuring; construction and the first
-    // clock reads may allocate, the steady-state acquire path must not.
     let clock = Arc::new(ManualClock::new());
     let bucket = Bucket::per_second(1_000).with_clock(Arc::clone(&clock));
-    for _ in 0..100 {
-        let _ = bucket.try_acquire(1);
-    }
-    clock.advance(Duration::from_secs(1));
 
-    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    // Warm up every operation the measured loop performs, so any one-time lazy
+    // initialisation in std or the OS happens before the measurement window.
+    let mut warm = 0u64;
+    for _ in 0..2_000 {
+        if bucket.try_acquire(1) {
+            warm += 1;
+        }
+        let _ = bucket.acquire(1);
+        let _ = bucket.available();
+        clock.advance(Duration::from_millis(1));
+    }
+    assert!(warm > 0);
+
+    // Steady-state window: the acquire path must allocate nothing here.
+    let before = alloc_count();
     let mut granted = 0u64;
     for _ in 0..100_000 {
         if bucket.try_acquire(1) {
@@ -76,14 +102,11 @@ fn test_acquire_path_does_not_allocate() {
         let _ = bucket.available();
         clock.advance(Duration::from_millis(1));
     }
-    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    let allocations = alloc_count() - before;
 
     assert_eq!(
-        after - before,
-        0,
-        "acquire path allocated {} time(s)",
-        after - before
+        allocations, 0,
+        "acquire path allocated {allocations} time(s) on the measuring thread"
     );
-    // Sanity: the loop actually did work, so the assertion above is meaningful.
-    assert!(granted > 0);
+    assert!(granted > 0); // the loop did real work, so the assertion is meaningful
 }
