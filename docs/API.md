@@ -41,7 +41,7 @@
 
 ```toml
 [dependencies]
-better-bucket = "0.7"
+better-bucket = "0.8"
 ```
 
 `no_std` build (exposes only [`VERSION`](#version); the `Bucket` surface needs
@@ -49,7 +49,7 @@ the default `clock` feature, which implies `std`):
 
 ```toml
 [dependencies]
-better-bucket = { version = "0.7", default-features = false }
+better-bucket = { version = "0.8", default-features = false }
 ```
 
 MSRV is **1.85** (Rust 2024 edition).

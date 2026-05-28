@@ -30,16 +30,7 @@
     <p>
         The safety contract is the headline feature: <b>the bucket never over-grants</b>. Across any concurrent interleaving, the total tokens handed out never exceed capacity plus accrued refill. That invariant is defended by <a href="https://github.com/tokio-rs/loom"><code>loom</code></a> model checking and <code>proptest</code>, not by hope.
     </p>
-    <br>
-    <hr>
-    <p>
-        <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Zero <code>unsafe</code> on the public path. <code>no_std</code>-capable.
-    </p>
-    <blockquote>
-        <strong>Status: pre-1.0, hardened, API frozen.</strong> The lock-free core, the full <code>Bucket</code> / <code>BucketBuilder</code> / <code>BucketConfig</code> / <code>Decision</code> / <code>TokenBucket</code> surface, the optimized division-free acquire path, and the adversarial/edge test suite are all in place; the public API is frozen until <code>1.0</code>. The no-over-grant invariant is defended by <code>loom</code> model checking, a multi-thread stress test, an allocation audit, an adversarial suite, and <code>proptest</code>. Remaining <code>0.x</code> work is real-world shake-out against <code>rate-net</code> and stabilization toward <code>1.0.0</code>. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for per-release detail.
-    </blockquote>
 </div>
-
 
 <hr>
 <br>
@@ -56,8 +47,6 @@ A token bucket is simple to get working and surprisingly hard to get <em>right</
 - **One-line API.** The 80% case is a constructor and a method call. No ceremony.
 
 <br>
-<hr>
-<br>
 
 ## Features
 
@@ -69,7 +58,6 @@ A token bucket is simple to get working and surprisingly hard to get <em>right</
 - **No over-grant guarantee** — verified with `loom` model checking, an allocation audit, a multi-thread stress test, and `proptest`
 - **Zero `unsafe`** on the public path
 
-<br>
 <hr>
 <br>
 
@@ -79,10 +67,10 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-better-bucket = "0.7"
+better-bucket = "0.8"
 
 # no_std build (no clock-lib; exposes only VERSION today — see Feature Flags):
-better-bucket = { version = "0.7", default-features = false }
+better-bucket = { version = "0.8", default-features = false }
 ```
 
 <hr>
@@ -106,7 +94,6 @@ if bucket.try_acquire(1) {
 
 That is the whole common case. No builder, no type parameters, no setup.
 
-<hr>
 <br>
 
 ## Configured Buckets (Tier 2)
@@ -142,7 +129,6 @@ never be constructed. For a custom time source, chain `.with_clock(...)` onto th
 built bucket. If you prefer to build the config value yourself, `BucketConfig::new`
 plus `Bucket::from_config` is the same path without the fluent surface.
 
-<hr>
 <br>
 
 ## Deterministic Testing (mockable clock)
@@ -268,7 +254,7 @@ cargo bench --features comparison           # + the governor comparison
 
 ```toml
 # no_std build (no clock-lib):
-better-bucket = { version = "0.7", default-features = false }
+better-bucket = { version = "0.8", default-features = false }
 ```
 
 > The lock-free accounting core uses only `core` atomics and is `no_std`-capable
@@ -277,21 +263,8 @@ better-bucket = { version = "0.7", default-features = false }
 > `no_std` build currently exposes only the crate's `VERSION`; a caller-driven,
 > clock-free time API is a candidate for a future release.
 
-<hr>
 <br>
 
-## Cross-Platform Support
-
-**Tier 1 Support:**
-- ✅ Linux (x86_64, aarch64)
-- ✅ macOS (x86_64, Apple Silicon)
-- ✅ Windows (x86_64)
-
-Behavior is identical across all three; the CI matrix runs every target on
-stable and MSRV. A commit that breaks any platform is a broken commit.
-
-<hr>
-<br>
 
 ## Testing
 
@@ -310,7 +283,6 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-<hr>
 <br>
 
 ## Where It Fits
@@ -323,19 +295,59 @@ rather than reimplementing the algorithm. `better-bucket` stays
 foreign-compatible: it works perfectly well on its own, with no obligation to
 pull in the rest of the family.
 
-<hr>
 <br>
+<br>
+
+<div align="center">
+    <img width="180px" height="auto" alt="rust bucket" src="./_assets/bucket.png">
+    <br>
+    <sup>BETTER <b>RUST</b> BUCKET</sup>
+</div>
+
+<br>
+<br>
+
+## Cross-Platform Support
+
+**Tier 1 Support:**
+- ✅ Linux (x86_64, aarch64)
+- ✅ macOS (x86_64, Apple Silicon)
+- ✅ Windows (x86_64)
+
+Behavior is identical across all three; the CI matrix runs every target on
+stable and MSRV. A commit that breaks any platform is a broken commit.
+
+<br>
+
+## Standards
+
+- **REPS** (**Rust Efficiency** &amp; **Performance Standards**). See [REPS.md](REPS.md).
+- **MSRV:** Rust 1.85.
+- **Edition:** 2024.
+
+<br>
+
+
 
 ## Contributing
 
-Contributions are welcome. Before opening a PR, make sure `cargo fmt`,
-`cargo clippy --all-targets --all-features -- -D warnings`, and
-`cargo test --all-features` are all clean, and that any change touching the
-acquire path is accompanied by a benchmark and (where it affects concurrency)
-a `loom` test.
+Contributions are welcome. 
+
+Before opening a PR, make sure everything is clean, and that any change touching the acquire path is accompanied by a benchmark and a `loom` test (where it affects concurrency).
+
+```bash
+# Format + lints
+cargo fmt
+cargo clippy --all-targets --all-features -- -D warnings
+
+# Run tests
+cargo test --all-features
+```
+
 
 <hr>
 <br>
+
 
 <!-- LICENSE
 ############################################# -->

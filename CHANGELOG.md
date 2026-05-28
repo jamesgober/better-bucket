@@ -22,6 +22,32 @@
 
 ---
 
+## [0.8.0] - 2026-05-27
+
+Alpha. The public surface is validated against the first-consumer pattern; no
+API friction was found, so nothing changed.
+
+### Added
+
+- `tests/consumer_pattern.rs` — a first-consumer shake-out that exercises the
+  surface the way a downstream limiter (e.g. `rate-net`) will: coding against
+  the `TokenBucket` trait rather than the concrete type, holding buckets with
+  different clocks behind `&dyn TokenBucket`, per-key buckets sharing one
+  injected clock, mapping `Decision` to an allow/deny with a retry hint, and the
+  config-then-inject-clock construction path. All four patterns read naturally
+  and pass.
+
+### Notes
+
+- **No API change.** The frozen surface is consumable as-is; the trait plus
+  clock injection plus `Decision` cover the keyed-limiter use case without
+  friction. The keyed store itself remains the consumer's concern, not this
+  crate's.
+- Real integration against `rate-net` happens in that crate when it is built;
+  this release confirms the surface is ready for it.
+
+---
+
 ## [0.7.0] - 2026-05-27
 
 Hardening and API freeze sign-off. No signature changes; the public surface is
@@ -279,7 +305,8 @@ implementation will be built on.
 - Libraries do not commit `Cargo.lock` (per portfolio convention); it is
   gitignored.
 
-[Unreleased]: https://github.com/jamesgober/better-bucket/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/jamesgober/better-bucket/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/jamesgober/better-bucket/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/better-bucket/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/better-bucket/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/better-bucket/compare/v0.3.0...v0.5.0
