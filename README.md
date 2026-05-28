@@ -315,7 +315,15 @@ pull in the rest of the family.
 <div align="center">
     <a href="./docs/DESIGN.md" title="A well designed bucket!"><img width="180px" height="auto" alt="rust bucket" src="./_assets/bucket.png"></a>
     <br>
-    <sup>BETTER <b>RUST</b> BUCKET</sup>
+    <sup>
+    <b>FASTER</b> 
+    <span>&nbsp;&plus;&nbsp;</span>
+    <b>LEANER</b>
+    <span>&nbsp;&plus;&nbsp;</span>
+    <b>SAFER</b>
+    </sup>
+    <br>
+    <strong>BETTER</strong>  
 </div>
 
 <br>
