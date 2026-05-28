@@ -22,6 +22,50 @@
 
 ---
 
+## [0.7.0] - 2026-05-27
+
+Hardening and API freeze sign-off. No signature changes; the public surface is
+frozen until 1.0.
+
+### Added
+
+- `tests/hardening.rs` — 13 adversarial and edge cases run by the full CI
+  matrix (Linux/macOS/Windows × stable + MSRV): requests at `u32::MAX`,
+  capacity/refill at `u32::MAX`, extreme and near-zero rates, the capacity
+  boundary matrix (`0` / `1` / `n-1` / `n` / `n+1`), exact-empty and
+  exact-full, zero-time-delta, a clock that never advances, enormous single
+  time advances, and concurrent acquire-while-reset. Each asserts the safety
+  contract: no panic, no wrap or overflow, no over-grant, tokens always within
+  `[0, capacity]`.
+
+### Changed
+
+- **The millisecond time field now wraps instead of saturating.** Elapsed time
+  is computed with `wrapping_sub`, which is correct for any gap shorter than the
+  ~49.7-day wrap window — i.e. for any bucket used at least once in that window,
+  which is every real limiter. This removes the long-uptime refill **stall** of
+  prior releases (where the counter pinned at `u32::MAX` and refill stopped, and
+  `reset` could not recover it because the time anchor is fixed at construction).
+  A bucket left fully idle for longer than ~49.7 days may under-refill once on
+  its next use — a safe, self-correcting outcome. Internal change, no API impact;
+  all safety invariants continue to hold (proven by `tests/hardening.rs` and
+  `loom`).
+- `Bucket::reset` documentation clarified: it discards debt for a fresh burst;
+  it is no longer described as a long-uptime workaround, which is unnecessary now
+  that the time field wraps safely.
+
+### Notes
+
+- **Public API frozen** as of this release (recorded in full in the project
+  roadmap): `Bucket`, `BucketBuilder`, `BucketConfig`, `Decision`,
+  `BucketError`, `TokenBucket`, `VERSION`. Only additive, non-breaking changes
+  through to 1.0.
+- Cross-platform atomic behavior is verified by the CI matrix running the unit,
+  stress, and hardening suites on Linux, macOS, and Windows on both stable and
+  MSRV.
+
+---
+
 ## [0.6.0] - 2026-05-27
 
 Optimization. The acquire path is faster and division-free; the comparative
@@ -235,7 +279,8 @@ implementation will be built on.
 - Libraries do not commit `Cargo.lock` (per portfolio convention); it is
   gitignored.
 
-[Unreleased]: https://github.com/jamesgober/better-bucket/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/jamesgober/better-bucket/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/jamesgober/better-bucket/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/better-bucket/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/better-bucket/compare/v0.3.0...v0.5.0
 [0.3.0]: https://github.com/jamesgober/better-bucket/compare/v0.2.0...v0.3.0

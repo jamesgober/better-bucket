@@ -36,7 +36,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Zero <code>unsafe</code> on the public path. <code>no_std</code>-capable.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, in active development.</strong> <code>0.3.0</code> ships the <strong>lock-free core</strong>: <code>try_acquire</code> is a single <code>compare_exchange_weak</code> on a packed atomic word, allocation-free and cache-line aligned. The no-over-grant invariant is defended by <code>loom</code> model checking, a multi-thread stress test, an allocation audit, and <code>proptest</code>. The public surface is unchanged from the <code>0.2</code> foundation; remaining <code>0.x</code> work is optimization, hardening, and benchmarks toward the <code>1.0.0</code> API freeze. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for per-release detail.
+        <strong>Status: pre-1.0, hardened, API frozen.</strong> The lock-free core, the full <code>Bucket</code> / <code>BucketBuilder</code> / <code>BucketConfig</code> / <code>Decision</code> / <code>TokenBucket</code> surface, the optimized division-free acquire path, and the adversarial/edge test suite are all in place; the public API is frozen until <code>1.0</code>. The no-over-grant invariant is defended by <code>loom</code> model checking, a multi-thread stress test, an allocation audit, an adversarial suite, and <code>proptest</code>. Remaining <code>0.x</code> work is real-world shake-out against <code>rate-net</code> and stabilization toward <code>1.0.0</code>. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for per-release detail.
     </blockquote>
 </div>
 
@@ -79,10 +79,10 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-better-bucket = "0.6"
+better-bucket = "0.7"
 
 # no_std build (no clock-lib; exposes only VERSION today — see Feature Flags):
-better-bucket = { version = "0.6", default-features = false }
+better-bucket = { version = "0.7", default-features = false }
 ```
 
 <hr>
@@ -223,9 +223,11 @@ bucket was created. Two consequences follow from that budget:
 - **Capacity tops out around 4.29 million tokens** (`u32::MAX` millitokens).
   That is an enormous burst ceiling for rate limiting; larger requests are
   clamped to it.
-- **The millisecond counter saturates after ~49.7 days** of clock advance, after
-  which refill stalls. `Bucket::reset()` re-anchors it (and refills to full), so
-  a process that runs longer than that between resets can call it periodically.
+- **The millisecond counter wraps every ~49.7 days.** The wrap is handled
+  (elapsed time is computed with `wrapping_sub`), so an actively-used bucket
+  refills correctly indefinitely — there is no long-uptime stall. Only a bucket
+  left fully idle for longer than ~49.7 days may under-refill once on its next
+  use, a safe and self-correcting outcome.
 
 <hr>
 <br>
@@ -266,7 +268,7 @@ cargo bench --features comparison           # + the governor comparison
 
 ```toml
 # no_std build (no clock-lib):
-better-bucket = { version = "0.6", default-features = false }
+better-bucket = { version = "0.7", default-features = false }
 ```
 
 > The lock-free accounting core uses only `core` atomics and is `no_std`-capable

@@ -17,9 +17,11 @@
 //! - **lower 32 bits** — milliseconds since the bucket's `created_at` anchor of
 //!   the last refill computation.
 //!
-//! The millisecond field saturates after ~49.7 days of clock advance, after
-//! which refill stalls; [`Bucket::reset`] re-anchors it for processes that run
-//! longer than that between resets.
+//! The millisecond field wraps every ~49.7 days. Elapsed time is computed with
+//! `wrapping_sub`, so refill stays correct for any gap shorter than that — i.e.
+//! for any bucket used at least once per ~49.7 days, which is every real
+//! limiter. A bucket left fully idle for longer may under-refill once on its
+//! next use, a safe and self-correcting outcome.
 
 use core::time::Duration;
 
@@ -84,9 +86,10 @@ fn tier1_config(capacity: u32, amount: u32, period: Duration, initial: u32) -> B
 /// # Limits
 ///
 /// The packed representation caps capacity at about 4.29 million tokens
-/// (`u32::MAX` millitokens) and tracks time in milliseconds relative to
-/// construction; that millisecond counter saturates after ~49.7 days of clock
-/// advance, stalling refill until [`reset`](Self::reset) re-anchors it.
+/// (`u32::MAX` millitokens). Time is tracked as 32-bit milliseconds since
+/// construction and wraps every ~49.7 days; the wrap is handled, so an
+/// actively-used bucket refills correctly indefinitely (only a bucket idle for
+/// longer than that may under-refill once, safely, on its next use).
 ///
 /// # Examples
 ///
@@ -349,12 +352,12 @@ impl<C: Clock> Bucket<C> {
         self.config
     }
 
-    /// Refills the bucket to full and re-anchors its internal clock to now.
+    /// Refills the bucket to full and marks it current as of now.
     ///
-    /// Two uses: discard accumulated debt to grant a fresh burst, and re-anchor
-    /// the internal millisecond counter on a process that runs longer than the
-    /// ~49.7-day saturation window (call `reset` periodically to keep refill
-    /// from stalling).
+    /// Use it to discard accumulated debt and grant a fresh burst — for example
+    /// at the start of a new billing window, or to clear a backlog after a
+    /// dependency recovers. Long uptime needs no special handling: the
+    /// millisecond counter wraps safely, so an actively-used bucket never stalls.
     ///
     /// # Examples
     ///
@@ -373,11 +376,17 @@ impl<C: Clock> Bucket<C> {
             .store(pack(self.capacity_millitokens, now_ms), Ordering::Relaxed);
     }
 
-    /// Milliseconds since `created_at`, saturating into the 32-bit time field.
+    /// Milliseconds since `created_at`, truncated into the 32-bit time field.
+    ///
+    /// The field wraps every ~49.7 days. [`refilled`](Self::refilled) computes
+    /// the elapsed interval with `wrapping_sub`, so the result is correct for
+    /// any gap shorter than that — i.e. for any bucket used at least once per
+    /// ~49.7 days, which covers every real limiter. A bucket left fully idle for
+    /// longer may under-refill once on its next use (safe and self-correcting).
     #[inline]
     fn now_ms(&self) -> u32 {
         let elapsed = self.clock.now().saturating_duration_since(self.created_at);
-        u32::try_from(elapsed.as_millis().min(u128::from(u32::MAX))).unwrap_or(u32::MAX)
+        (elapsed.as_millis() & u128::from(u32::MAX)) as u32
     }
 
     /// The millitoken count after refilling over `last_ms → now_ms`, capped at
@@ -390,7 +399,9 @@ impl<C: Clock> Bucket<C> {
         if self.refill_per_ms_q == 0 {
             return tokens_mt;
         }
-        let elapsed_ms = now_ms.saturating_sub(last_ms);
+        // `wrapping_sub` is correct because the 32-bit ms field wraps: the true
+        // elapsed interval is recovered for any gap shorter than ~49.7 days.
+        let elapsed_ms = now_ms.wrapping_sub(last_ms);
         if elapsed_ms == 0 {
             return tokens_mt;
         }

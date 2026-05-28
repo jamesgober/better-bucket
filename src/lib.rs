@@ -16,15 +16,16 @@
 //!
 //! ## Status
 //!
-//! Pre-1.0, under active development. The API is **frozen** until `1.0`: the
-//! lock-free [`Bucket`], the Tier-2 [`BucketBuilder`], [`BucketConfig`],
-//! [`Decision`], [`BucketError`], and the [`TokenBucket`] trait. `try_acquire`
-//! is a single `compare_exchange_weak` on a packed atomic word —
-//! allocation-free, cache-line aligned, with a division-free fixed-point refill
-//! — and the no-over-grant invariant is defended by `loom`, a stress test, an
-//! allocation audit, and `proptest`. The bucket's own accounting measures around
-//! six nanoseconds; end-to-end `try_acquire` is bounded by the monotonic clock
-//! read. See `docs/BENCHMARKS.md` for numbers and the `governor` comparison.
+//! Pre-1.0, hardened, **API frozen** until `1.0`: the lock-free [`Bucket`], the
+//! Tier-2 [`BucketBuilder`], [`BucketConfig`], [`Decision`], [`BucketError`],
+//! and the [`TokenBucket`] trait. `try_acquire` is a single
+//! `compare_exchange_weak` on a packed atomic word — allocation-free, cache-line
+//! aligned, with a division-free fixed-point refill. The safety contract (no
+//! panic, no wrap, no over-grant, tokens in `[0, capacity]`) holds under
+//! adversarial inputs and extreme uptime, defended by `loom`, a stress test, an
+//! allocation audit, an adversarial/edge suite, and `proptest`. The bucket's own
+//! accounting measures around six nanoseconds; end-to-end `try_acquire` is
+//! bounded by the monotonic clock read. See `docs/BENCHMARKS.md` for numbers.
 //!
 //! Token bucket is the crate's sole algorithm by design — leaky-bucket and
 //! sliding-window limiting live in the downstream `rate-net` crate.
@@ -125,7 +126,7 @@ pub use crate::error::BucketError;
 /// ```
 /// // Reports the current 0.x series and carries a major.minor.patch core.
 /// let version = better_bucket::VERSION;
-/// assert!(version.starts_with("0.6"));
+/// assert!(version.starts_with("0.7"));
 /// assert_eq!(version.split('.').count(), 3);
 /// ```
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

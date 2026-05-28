@@ -41,7 +41,7 @@
 
 ```toml
 [dependencies]
-better-bucket = "0.6"
+better-bucket = "0.7"
 ```
 
 `no_std` build (exposes only [`VERSION`](#version); the `Bucket` surface needs
@@ -49,7 +49,7 @@ the default `clock` feature, which implies `std`):
 
 ```toml
 [dependencies]
-better-bucket = { version = "0.6", default-features = false }
+better-bucket = { version = "0.7", default-features = false }
 ```
 
 MSRV is **1.85** (Rust 2024 edition).
@@ -61,9 +61,10 @@ milliseconds since construction (lower 32 bits). Two consequences:
 
 - Capacity is effectively capped at **~4.29 million tokens** (`u32::MAX`
   millitokens); larger values are clamped.
-- `retry_after` is reported at **millisecond** resolution, and the millisecond
-  counter saturates after **~49.7 days** of clock advance, after which refill
-  stalls until [`reset`](#bucketreset) re-anchors it.
+- `retry_after` is reported at **millisecond** resolution.
+- The millisecond counter **wraps every ~49.7 days**; the wrap is handled, so an
+  actively-used bucket refills correctly indefinitely. Only a bucket idle for
+  longer than that may under-refill once (safely) on its next use.
 
 ---
 
@@ -310,10 +311,10 @@ assert_eq!(Bucket::per_second(64).capacity(), 64);
 pub fn reset(&self)
 ```
 
-Refills the bucket to full and re-anchors its internal millisecond counter to
-the current time. Two uses: discard accumulated debt to grant a fresh burst,
-and keep refill alive on a process that runs longer than the ~49.7-day
-saturation window (call `reset` periodically).
+Refills the bucket to full and marks it current as of now. Use it to discard
+accumulated debt and grant a fresh burst — for example at the start of a new
+billing window. Long uptime needs no special handling: the millisecond counter
+wraps safely, so an actively-used bucket never stalls.
 
 **Examples**
 
