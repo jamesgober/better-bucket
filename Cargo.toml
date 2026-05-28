@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "better-bucket"
-version = "0.9.5"
+version = "1.0.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -26,10 +26,10 @@ description = "A genuinely better token bucket for Rust: lock-free, allocation-f
 
 # Keywords (5 max)
 keywords = [
-    "rate-limiting",
     "token-bucket",
+    "rate-limiting",
+    "ratelimit",
     "throttle",
-    "lock-free",
     "backpressure"
 ]
 
@@ -80,19 +80,17 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 # Default build: std on, monotonic system clock available.
 default = ["std", "clock"]
 
-# Standard library. With it off, the crate is `no_std` and the caller must
-# drive time explicitly (inject ticks / a custom Clock). The lock-free core
-# does not require std. Propagates std to clock-lib when that feature is on.
+# Standard library. With it off, the crate is `no_std`. The lock-free accounting
+# core needs only `core` atomics, but the `Bucket` surface reads the clock, so a
+# bare `no_std` build exposes only `VERSION`. Propagates std to clock-lib when
+# the `clock` feature is on.
 std = ["clock-lib?/std"]
 
 # Pluggable clock source (clock-lib): monotonic time + a mockable clock for
-# deterministic, sleep-free tests. On by default; turn off for a pure
-# caller-driven-tick build.
+# deterministic, sleep-free tests. On by default.
 #
-# `clock` implies `std`: clock-lib's `Clock` trait (and `ManualClock`) are
-# themselves std-gated, and the current single-bucket implementation uses a
-# std `Mutex` for interior mutability. The lock-free, no_std-capable core
-# lands in 0.3.0 and lifts the std requirement from the caller-driven path.
+# `clock` implies `std` because clock-lib's `Clock` trait (and `ManualClock`)
+# are themselves std-gated. It gates the entire `Bucket` surface.
 clock = ["std", "dep:clock-lib", "dep:error-forge"]
 
 # Benchmark-only: pulls in `governor` for the comparative benchmark
@@ -170,6 +168,10 @@ required-features = ["clock"]
 
 [[example]]
 name              = "builder"
+required-features = ["clock"]
+
+[[example]]
+name              = "admission_control"
 required-features = ["clock"]
 
 

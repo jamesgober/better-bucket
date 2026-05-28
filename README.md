@@ -28,7 +28,7 @@
         Most "token bucket" crates make you choose between speed and a sane API. This one refuses the trade. The common case is one line — <code>Bucket::per_second(100)</code> then <code>bucket.try_acquire(1)</code> — and that one-line path <em>is</em> the fast path. Power users get a builder and a full trait surface; nobody is forced through generic soup to rate-limit a loop.
     </p>
     <p>
-        The safety contract is the headline feature: <b>the bucket never over-grants</b>. Across any concurrent interleaving, the total tokens handed out never exceed capacity plus accrued refill. That invariant is defended by <a href="https://github.com/tokio-rs/loom"><code>loom</code></a> model checking and <code>proptest</code>, not by hope.
+        The safety contract is the headline feature: <b>the bucket never over-grants</b>. Across any concurrent interleaving, the total tokens handed out never exceed capacity plus accrued refill. That invariant is defended by <a href="https://github.com/tokio-rs/loom"><code>loom</code></a> model checking, a multi-thread stress test, and <code>proptest</code> — not by hope.
     </p>
 </div>
 
@@ -43,7 +43,7 @@ A token bucket is simple to get working and surprisingly hard to get <em>right</
 - **Allocation-free steady state.** Acquiring never allocates. A bucket is a small, cache-line-aligned value with no heap tail.
 - **Lazy refill.** Tokens accrue from elapsed monotonic time, computed on access. No timer thread burning a core, no wakeups, no watts spent while idle.
 - **Overflow-safe.** Every refill and capacity computation is checked or saturating. A hostile request count or a multi-day idle gap can't wrap the counter or over-fill the bucket.
-- **Never over-grants.** The core safety invariant, proven under `loom` and `proptest`.
+- **Never over-grants.** The core safety invariant, defended by `loom` model checking, a multi-thread stress test, an allocation audit, an adversarial suite, and `proptest`.
 - **One-line API.** The 80% case is a constructor and a method call. No ceremony.
 
 <br>
@@ -67,10 +67,10 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-better-bucket = "0.9"
+better-bucket = "1"
 
-# no_std build (no clock-lib; exposes only VERSION today — see Feature Flags):
-better-bucket = { version = "0.9", default-features = false }
+# no_std build (no clock-lib; exposes only VERSION — see Feature Flags):
+better-bucket = { version = "1", default-features = false }
 ```
 
 <hr>
@@ -171,7 +171,8 @@ loop:
 1. Load the packed word.
 2. Compute lazy refill from monotonic elapsed time (saturating).
 3. If enough tokens, CAS the new `(tokens - n, now_tick)` in place.
-4. On CAS failure (another thread won the race), retry with bounded backoff.
+4. On CAS failure (another thread won the race), retry — emitting a CPU
+   spin-loop hint under contention to ease cache-line pressure.
 
 There is no lock, no allocation, and no syscall on the success path beyond the
 monotonic clock read. Independent buckets sit on their own cache lines, so
@@ -220,22 +221,28 @@ bucket was created. Two consequences follow from that budget:
 
 The acquire path is division-free: the refill rate is precomputed at
 construction, so the hot path is one packed-word load, a multiply-and-shift, and
-a CAS. On a Ryzen 9 9950X3D the bucket's own accounting measures **~6 ns**
+a CAS. On a Ryzen 9 9950X3D the bucket's own accounting measures **~5 ns**
 (isolated with a mock clock). A real `try_acquire` adds one monotonic clock read
-on top — the dominant cost — for a single-thread figure of **~24 ns**, most of
+on top — the dominant cost — for a single-thread figure of **~21 ns**, most of
 it the `Instant::now()` call rather than the bucket. Contended throughput scales
 with threads; the lock-free CAS has no lock to serialize on.
 
 ### vs `governor`
 
-On the **same monotonic clock**, `better-bucket` and `governor` are tied
-(~24 vs ~23 ns, both bounded by the clock read). The bucket's *algorithm* is at
-least as lean — with a cheap clock it runs in ~6 ns, edging `governor` on its
-fast `quanta` clock (~7 ns). Out of the box, `governor` is faster end-to-end
-(~7 ns) purely because its default `quanta` clock beats the `Instant` clock
-`better-bucket` reads through `clock-lib` — a clock difference, not an algorithm
-one. Full numbers, method, and machine details are in
-[`docs/BENCHMARKS.md`](./docs/BENCHMARKS.md).
+Honest framing: `governor` is **GCRA** (store one timestamp, compare it) while
+`better-bucket` is a **token bucket** (track and refill a count, clamp to a
+capacity, support multi-token acquires, bursts, and introspection). GCRA does
+less work, so on the same monotonic clock `governor` is ~10–13% faster per call
+(~20 vs ~23 ns), and faster still out of the box because its default `quanta`
+clock beats the `Instant` clock `better-bucket` reads through `clock-lib`.
+
+`better-bucket` is the fastest, safest token bucket in *its* class — lock-free
+and allocation-free where `leaky-bucket` uses a background task and hand-rolled
+buckets use a `Mutex`, with a `loom`-proven no-over-grant contract and real token
+semantics. Reach for `governor` when a bare allow/deny decision is all you need;
+reach for `better-bucket` when you want an actual token bucket. Either way the
+end-to-end cost is bounded by the clock. Full numbers, method, and the honest
+analysis are in [`docs/BENCHMARKS.md`](./docs/BENCHMARKS.md).
 
 ```bash
 cargo bench --bench bucket_bench            # better-bucket baselines
@@ -254,7 +261,7 @@ cargo bench --features comparison           # + the governor comparison
 
 ```toml
 # no_std build (no clock-lib):
-better-bucket = { version = "0.9", default-features = false }
+better-bucket = { version = "1", default-features = false }
 ```
 
 > The lock-free accounting core uses only `core` atomics and is `no_std`-capable
@@ -333,6 +340,8 @@ stable and MSRV. A commit that breaks any platform is a broken commit.
   refill, the wrapping clock, and how the no-over-grant contract is defended.
 - [**Benchmarks**](./docs/BENCHMARKS.md) — numbers, method, and the `governor`
   comparison.
+- [**Stability**](./docs/STABILITY.md) — the frozen `1.x` surface and the SemVer
+  contract.
 - [**CHANGELOG**](./CHANGELOG.md) — per-release detail.
 
 <br>

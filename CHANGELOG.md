@@ -22,6 +22,52 @@
 
 ---
 
+## [1.0.0] - 2026-05-28
+
+Stable. The public API is frozen under strict SemVer; see
+[`docs/STABILITY.md`](docs/STABILITY.md) for the committed surface and the
+contract. Pin `better-bucket = "1"` and expect `1.x` to stay backwards
+compatible.
+
+### Added
+
+- `docs/STABILITY.md` — the frozen `1.x` surface, SemVer commitments, behavioural
+  contracts, representation limits, and what is explicitly not promised.
+- A high-contention, multi-token exact-conservation test: 16 threads against a
+  no-refill bucket whose capacity is not a multiple of the take size, asserting
+  every token is either granted or still available — none lost, duplicated, or
+  granted beyond capacity.
+- `examples/admission_control.rs` — the canonical use case: rate-limit requests
+  and answer each denial with a `Retry-After` derived from the `Decision`.
+
+### Changed
+
+- The contended CAS retry now emits a `core::hint::spin_loop()` hint, easing
+  cache-line pressure under contention; the uncontended path (which never
+  retries) is unchanged.
+- `#[inline]` added to the public `acquire` / `try_acquire` / `available` methods
+  and the `TokenBucket` trait impl, so the hot path inlines into consumer code.
+  The bucket's own accounting now measures ~5 ns.
+- `docs/BENCHMARKS.md` refreshed with the final `1.0` numbers and an honest
+  `governor` comparison: `governor` is GCRA (one timestamp) and is a little
+  faster per call than a token bucket on the same clock; `better-bucket` is the
+  fastest, safest token bucket in its class, with semantics GCRA does not
+  provide. The clock dominates end-to-end for both.
+- Documentation polished for release: pre-1.0 status notes removed, every public
+  item in `docs/API.md` carries multiple examples, and inaccurate claims (the
+  old "no_std-capable" framing, the stale `retry with bounded backoff` note, and
+  a `Cargo.toml` comment that still described a `Mutex`) corrected.
+- Crate keyword `lock-free` replaced with `ratelimit` — a quality attribute
+  swapped for a search term consumers actually use to find a rate limiter.
+
+### Notes
+
+- **No breaking changes.** Every `0.9.5` call site compiles and behaves
+  identically.
+- **MSRV frozen at Rust 1.85.**
+
+---
+
 ## [0.9.5] - 2026-05-28
 
 Release candidate. Documentation polish only — no code or API change. The
@@ -362,7 +408,8 @@ implementation will be built on.
 - Libraries do not commit `Cargo.lock` (per portfolio convention); it is
   gitignored.
 
-[Unreleased]: https://github.com/jamesgober/better-bucket/compare/v0.9.5...HEAD
+[Unreleased]: https://github.com/jamesgober/better-bucket/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/jamesgober/better-bucket/compare/v0.9.5...v1.0.0
 [0.9.5]: https://github.com/jamesgober/better-bucket/compare/v0.9.0...v0.9.5
 [0.9.0]: https://github.com/jamesgober/better-bucket/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/better-bucket/compare/v0.7.0...v0.8.0

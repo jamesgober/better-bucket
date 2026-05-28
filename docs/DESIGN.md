@@ -135,11 +135,14 @@ that grants nothing.
 
 The bucket's own accounting is a few nanoseconds. End-to-end, `try_acquire` is
 dominated by the monotonic clock read (`Instant::now()` via
-[`clock-lib`](https://crates.io/crates/clock-lib)). On the same clock the bucket
-ties the incumbent (`governor`); `governor` is faster out-of-the-box only because
-its default clock (`quanta`, TSC-calibrated) is faster than `Instant`. Closing
-that gap is a `clock-lib` concern — a faster monotonic source — not a bucket one.
-The bucket is already at its floor.
+[`clock-lib`](https://crates.io/crates/clock-lib)). Against `governor` on the
+same clock, `governor` is a little faster per call — it is GCRA (one timestamp,
+one compare), which does less work than a token bucket's count-and-refill, so a
+few nanoseconds separate them. Out of the box `governor` is faster still because
+its default `quanta` clock beats `Instant`. The token-bucket accounting here is
+already at its floor; the remaining end-to-end gap is the clock, a `clock-lib`
+concern (a faster monotonic source), not a bucket one. See
+[`BENCHMARKS.md`](BENCHMARKS.md) for the numbers and the honest analysis.
 
 The clock is **injected** (`Bucket<C: Clock>`), so a consumer or test supplies
 its own — chiefly `clock-lib`'s `ManualClock`, which makes time-driven behaviour

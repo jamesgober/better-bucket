@@ -3,10 +3,9 @@
 > Complete reference for every public item in `better-bucket`, with examples.
 > Format mirrors the portfolio standard ([metrics-lib API.md](https://github.com/jamesgober/metrics-lib/blob/main/docs/API.md)).
 >
-> **Status: pre-1.0, API frozen.** The surface documented below is complete and
-> frozen until `1.0` (lock-free core in `0.3`, builder + feature freeze in `0.5`,
-> optimization in `0.6`). `try_acquire` is a single `compare_exchange_weak` on a
-> packed atomic word, allocation-free, with a division-free fixed-point refill.
+> `try_acquire` is a single `compare_exchange_weak` on a packed atomic word —
+> allocation-free, cache-line aligned, with a division-free fixed-point refill.
+> The surface below is the complete, stable public API.
 
 ## Table of Contents
 
@@ -41,7 +40,7 @@
 
 ```toml
 [dependencies]
-better-bucket = "0.9"
+better-bucket = "1"
 ```
 
 `no_std` build (exposes only [`VERSION`](#version); the `Bucket` surface needs
@@ -49,7 +48,7 @@ the default `clock` feature, which implies `std`):
 
 ```toml
 [dependencies]
-better-bucket = { version = "0.9", default-features = false }
+better-bucket = { version = "1", default-features = false }
 ```
 
 MSRV is **1.85** (Rust 2024 edition).
@@ -288,6 +287,23 @@ assert!(bucket.try_acquire(4));
 assert_eq!(bucket.available(), 6);
 ```
 
+Observing refill deterministically with an injected clock:
+
+```rust
+use better_bucket::Bucket;
+use clock_lib::ManualClock;
+use std::sync::Arc;
+use std::time::Duration;
+
+let clock = Arc::new(ManualClock::new());
+let bucket = Bucket::per_second(100).with_clock(Arc::clone(&clock));
+
+assert!(bucket.try_acquire(100));         // drain
+assert_eq!(bucket.available(), 0);
+clock.advance(Duration::from_millis(250)); // a quarter second
+assert_eq!(bucket.available(), 25);        // 25% of the per-second rate
+```
+
 ### `Bucket::capacity`
 
 ```rust
@@ -303,6 +319,16 @@ hold.
 use better_bucket::Bucket;
 
 assert_eq!(Bucket::per_second(64).capacity(), 64);
+```
+
+The capacity is the largest burst grantable at once:
+
+```rust
+use better_bucket::Bucket;
+
+let bucket = Bucket::per_second(50);
+assert!(bucket.try_acquire(bucket.capacity())); // a full-capacity burst
+assert!(!bucket.try_acquire(1));                 // now empty
 ```
 
 ### `Bucket::reset`
@@ -326,6 +352,18 @@ assert!(bucket.try_acquire(4));
 assert_eq!(bucket.available(), 0);
 bucket.reset();
 assert_eq!(bucket.available(), 4);
+```
+
+Clearing a backlog so the next window starts clean:
+
+```rust
+use better_bucket::Bucket;
+
+let quota = Bucket::per_second(1_000);
+assert!(quota.try_acquire(800)); // 800 spent this window
+// New billing window begins — forgive the spend and start full.
+quota.reset();
+assert_eq!(quota.available(), 1_000);
 ```
 
 ---
@@ -421,6 +459,20 @@ assert_eq!(bucket.capacity(), 500);
 # Ok::<(), better_bucket::BucketError>(())
 ```
 
+A large burst ceiling that refills slowly, starting full:
+
+```rust
+use better_bucket::{Bucket, BucketConfig};
+use std::time::Duration;
+
+// Hold up to 10_000, but only top up 10/second.
+let config = BucketConfig::new(10_000, 10, Duration::from_secs(1), 10_000)?;
+let bucket = Bucket::from_config(config);
+assert!(bucket.try_acquire(10_000)); // the whole burst, at once
+assert!(!bucket.try_acquire(1));     // and now it refills slowly
+# Ok::<(), better_bucket::BucketError>(())
+```
+
 ### `Bucket::with_clock`
 
 ```rust
@@ -455,6 +507,24 @@ clock.advance(Duration::from_millis(500)); // half a period
 assert_eq!(bucket.available(), 5);
 ```
 
+Chaining onto a configured bucket, so a test drives a non-default quota:
+
+```rust
+use better_bucket::{Bucket, BucketConfig};
+use clock_lib::ManualClock;
+use std::sync::Arc;
+use std::time::Duration;
+
+let clock = Arc::new(ManualClock::new());
+let config = BucketConfig::new(100, 10, Duration::from_secs(1), 0)?;
+let bucket = Bucket::from_config(config).with_clock(Arc::clone(&clock));
+
+assert_eq!(bucket.available(), 0);   // started empty
+clock.advance(Duration::from_secs(1));
+assert_eq!(bucket.available(), 10);  // one second of refill
+# Ok::<(), better_bucket::BucketError>(())
+```
+
 ### `Bucket::config` <a id="bucketconfig-method"></a>
 
 ```rust
@@ -472,6 +542,25 @@ use std::time::Duration;
 
 let bucket = Bucket::per_second(10);
 assert_eq!(bucket.config().refill_period(), Duration::from_secs(1));
+```
+
+Reading back every field of a configured bucket:
+
+```rust
+use better_bucket::Bucket;
+use std::time::Duration;
+
+let config = Bucket::builder()
+    .capacity(500)
+    .refill(100, Duration::from_secs(1))
+    .initial(0)
+    .build()?
+    .config();
+
+assert_eq!(config.capacity(), 500);
+assert_eq!(config.refill_amount(), 100);
+assert_eq!(config.initial(), 0);
+# Ok::<(), better_bucket::BucketError>(())
 ```
 
 ### `Bucket::builder`
@@ -613,6 +702,25 @@ assert!(denied.is_denied());
 assert_eq!(denied.retry_after(), Some(Duration::from_millis(250)));
 ```
 
+Matching the outcome — the typical gatekeeper shape, turning a denial's
+`retry_after` into a `Retry-After` header value:
+
+```rust
+use better_bucket::{Bucket, Decision};
+
+let limiter = Bucket::per_second(1);
+assert!(limiter.try_acquire(1)); // spend the one token
+
+match limiter.acquire(1) {
+    Decision::Allowed => { /* serve the request */ }
+    Decision::Denied { retry_after } => {
+        let seconds = retry_after.as_secs_f64().ceil() as u64;
+        assert!(seconds >= 1); // tell the client when to come back
+    }
+    _ => {}
+}
+```
+
 ### `BucketError`
 
 ```rust
@@ -669,10 +777,15 @@ Available in every build configuration, including bare `no_std`.
 **Examples**
 
 ```rust
-println!("better-bucket {}", better_bucket::VERSION);
-
 let version = better_bucket::VERSION;
 assert_eq!(version.split('.').count(), 3); // major.minor.patch
+```
+
+Reporting the linked version in a diagnostics line:
+
+```rust
+let banner = format!("rate limiter: better-bucket v{}", better_bucket::VERSION);
+assert!(banner.contains("better-bucket v"));
 ```
 
 ---
@@ -684,9 +797,10 @@ assert_eq!(version.split('.').count(), 3); // major.minor.patch
 | `std`   | yes     | Standard library. Off → `no_std`. |
 | `clock` | yes     | Pluggable [`clock-lib`](https://crates.io/crates/clock-lib) time source + mockable clock for tests. **Implies `std`** (clock-lib's `Clock` is std-gated), and gates the entire `Bucket` surface. |
 
-A bare `no_std` build (`default-features = false`) currently exposes only
-[`VERSION`](#version). The `Bucket` surface requires the `clock` feature; the
-`no_std`-capable, caller-driven core lands with the lock-free rewrite in `0.3`.
+The lock-free accounting core uses only `core` atomics, but the shipped `Bucket`
+constructors read time from `clock-lib`, so the `clock` feature gates the whole
+`Bucket` surface. A bare `no_std` build (`default-features = false`) exposes only
+[`VERSION`](#version).
 
 ---
 

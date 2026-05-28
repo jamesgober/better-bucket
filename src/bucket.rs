@@ -275,6 +275,7 @@ impl<C: Clock> Bucket<C> {
     /// assert_eq!(bucket.acquire(3), Decision::Allowed);
     /// assert_eq!(bucket.available(), 2);
     /// ```
+    #[inline]
     pub fn acquire(&self, n: u32) -> Decision {
         self.acquire_inner(n)
     }
@@ -294,6 +295,7 @@ impl<C: Clock> Bucket<C> {
     /// assert!(bucket.try_acquire(1));
     /// assert!(!bucket.try_acquire(1)); // drained
     /// ```
+    #[inline]
     #[must_use]
     pub fn try_acquire(&self, n: u32) -> bool {
         self.acquire_inner(n).is_allowed()
@@ -314,6 +316,7 @@ impl<C: Clock> Bucket<C> {
     /// assert!(bucket.try_acquire(4));
     /// assert_eq!(bucket.available(), 6);
     /// ```
+    #[inline]
     #[must_use]
     pub fn available(&self) -> u32 {
         let now_ms = self.now_ms();
@@ -455,12 +458,18 @@ impl<C: Clock> Bucket<C> {
             // Relaxed is sufficient: the only shared state is this word, and the
             // CAS gives the read-modify-write atomicity the no-over-grant
             // contract depends on. A spurious or lost race retries.
-            if self
-                .state
-                .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                return Decision::Allowed;
+            match self.state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Decision::Allowed,
+                // Lost the race (or a spurious weak failure). Hint the CPU that
+                // we are in a retry spin before recomputing — this eases the
+                // cache-line contention and yields to a sibling SMT thread, and
+                // costs nothing on the uncontended path, which never gets here.
+                Err(_) => core::hint::spin_loop(),
             }
         }
     }
@@ -500,18 +509,22 @@ pub trait TokenBucket {
 }
 
 impl<C: Clock> TokenBucket for Bucket<C> {
+    #[inline]
     fn acquire(&self, n: u32) -> Decision {
         self.acquire_inner(n)
     }
 
+    #[inline]
     fn try_acquire(&self, n: u32) -> bool {
         self.acquire_inner(n).is_allowed()
     }
 
+    #[inline]
     fn available(&self) -> u32 {
         Bucket::available(self)
     }
 
+    #[inline]
     fn capacity(&self) -> u32 {
         self.capacity()
     }
@@ -711,6 +724,49 @@ mod tests {
         let total: u32 = handles.into_iter().map(|h| h.join().unwrap()).sum();
         assert_eq!(total, 100, "CAS bucket must grant exactly capacity");
         assert_eq!(bucket.available(), 0);
+    }
+
+    #[test]
+    fn test_high_contention_conserves_every_token() {
+        // The accuracy certification: 16 threads hammer one no-refill bucket,
+        // each taking 3 tokens at a time. Capacity is not a multiple of the take
+        // size, so the last partial request cannot fit. With no refill, every
+        // token must be accounted for — either granted or still available — with
+        // none lost, duplicated, or handed out beyond capacity.
+        const CAPACITY: u32 = 6_001;
+        const THREADS: u32 = 16;
+        const TAKE: u32 = 3;
+
+        let clock = Arc::new(ManualClock::new()); // never advanced => no refill
+        let bucket = Arc::new(Bucket::per_second(CAPACITY).with_clock(clock));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let bucket = Arc::clone(&bucket);
+                thread::spawn(move || {
+                    let mut taken = 0u32;
+                    for _ in 0..CAPACITY {
+                        if bucket.try_acquire(TAKE) {
+                            taken += TAKE;
+                        }
+                    }
+                    taken
+                })
+            })
+            .collect();
+
+        let granted: u32 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+
+        // No over-grant: never more than capacity (and a multiple of the take).
+        assert!(granted <= CAPACITY, "over-grant: {granted} > {CAPACITY}");
+        assert_eq!(granted % TAKE, 0, "a partial take was granted");
+        // Exact conservation: granted + still-available == the initial capacity.
+        // Any lost, duplicated, or corrupted token breaks this equality.
+        assert_eq!(
+            bucket.available(),
+            CAPACITY - granted,
+            "tokens were lost or corrupted under contention"
+        );
     }
 
     #[test]

@@ -14,20 +14,17 @@
 //! consumer is the `rate-net` rate limiter) without dragging in an async
 //! runtime or a keyed-state store.
 //!
-//! ## Status
+//! ## Guarantees
 //!
-//! Pre-1.0 (release candidate), hardened, **API frozen** until `1.0`: the lock-free
-//! [`Bucket`], the Tier-2 [`BucketBuilder`], [`BucketConfig`], [`Decision`],
-//! [`BucketError`], and the [`TokenBucket`] trait. The surface is validated
-//! against the first-consumer pattern (trait-based checks, injected shared
-//! clock, [`Decision`]-to-retry mapping) with no friction. `try_acquire` is a
-//! single `compare_exchange_weak` on a packed atomic word — allocation-free,
-//! cache-line aligned, with a division-free fixed-point refill. The safety
-//! contract (no panic, no wrap, no over-grant, tokens in `[0, capacity]`) holds
-//! under adversarial inputs and extreme uptime, defended by `loom`, a stress
-//! test, an allocation audit, an adversarial/edge suite, and `proptest`. The
-//! bucket's own accounting measures around six nanoseconds; end-to-end
-//! `try_acquire` is bounded by the monotonic clock read. See `docs/BENCHMARKS.md`.
+//! The safety contract holds under any concurrent interleaving, adversarial
+//! input, and extreme uptime: **no panic, no wrap, no over-grant, and tokens
+//! always within `[0, capacity]`.** It is defended by `loom` model checking, a
+//! multi-thread stress test, an allocation audit, an adversarial/edge suite, and
+//! `proptest`. `try_acquire` is a single `compare_exchange_weak` on a packed
+//! atomic word — allocation-free, cache-line aligned, with a division-free
+//! fixed-point refill. The bucket's own accounting measures a few nanoseconds;
+//! end-to-end `try_acquire` is bounded by the monotonic clock read (see
+//! `docs/BENCHMARKS.md`).
 //!
 //! Token bucket is the crate's sole algorithm by design — leaky-bucket and
 //! sliding-window limiting live in the downstream `rate-net` crate.
@@ -48,10 +45,10 @@
 //! ```
 //!
 //! The bucket reads time from [`clock-lib`](https://crates.io/crates/clock-lib);
-//! the `clock` feature (on by default) provides it and implies `std`. A bare
-//! `no_std` build (`default-features = false`) currently exposes only
-//! [`VERSION`] — the no_std-capable, caller-driven core lands with the lock-free
-//! rewrite in `0.3`.
+//! the `clock` feature (on by default) provides it and implies `std`. The
+//! lock-free accounting core needs only `core`, but the shipped `Bucket`
+//! constructors read the clock, so a bare `no_std` build
+//! (`default-features = false`) exposes only [`VERSION`].
 //!
 //! ## Design goals
 //!
@@ -126,9 +123,9 @@ pub use crate::error::BucketError;
 /// # Examples
 ///
 /// ```
-/// // Reports the current 0.x series and carries a major.minor.patch core.
+/// // Reports the crate version as a `major.minor.patch` string.
 /// let version = better_bucket::VERSION;
-/// assert!(version.starts_with("0.9"));
+/// assert!(version.starts_with("1."));
 /// assert_eq!(version.split('.').count(), 3);
 /// ```
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
