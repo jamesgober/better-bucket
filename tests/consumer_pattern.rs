@@ -139,11 +139,15 @@ fn test_consumer_builds_per_key_buckets_in_one_step() {
 #[test]
 fn test_consumer_trait_defaults_for_a_foreign_implementation() {
     // A consumer's own `TokenBucket` (written against 1.0) keeps compiling, and
-    // the provided methods answer conservatively.
-    struct Fixed(u32);
+    // the provided methods answer conservatively: `None` only for "never",
+    // `Some(Duration::MAX)` for "not now, wait unknown".
+    struct Fixed {
+        available: u32,
+        capacity: u32,
+    }
     impl TokenBucket for Fixed {
         fn acquire(&self, n: u32) -> Decision {
-            if n <= self.0 {
+            if n <= self.available {
                 Decision::Allowed
             } else {
                 Decision::Denied {
@@ -155,17 +159,22 @@ fn test_consumer_trait_defaults_for_a_foreign_implementation() {
             self.acquire(n).is_allowed()
         }
         fn available(&self) -> u32 {
-            self.0
+            self.available
         }
         fn capacity(&self) -> u32 {
-            self.0
+            self.capacity
         }
     }
 
-    let fixed = Fixed(3);
+    let fixed = Fixed {
+        available: 1,
+        capacity: 3,
+    };
     assert_eq!(fixed.time_until(0), Some(Duration::ZERO));
-    assert_eq!(fixed.time_until(3), Some(Duration::ZERO));
-    assert_eq!(fixed.time_until(4), None);
+    assert_eq!(fixed.time_until(1), Some(Duration::ZERO));
+    assert_eq!(fixed.time_until(2), Some(Duration::MAX)); // drained, not never
+    assert_eq!(fixed.time_until(3), Some(Duration::MAX));
+    assert_eq!(fixed.time_until(4), None); // above capacity: never
     fixed.reset(); // provided no-op
-    assert_eq!(fixed.available(), 3);
+    assert_eq!(fixed.available(), 1);
 }

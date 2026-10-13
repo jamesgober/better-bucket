@@ -705,10 +705,17 @@ pub trait TokenBucket {
     /// Returns how long until `n` tokens could be acquired, without taking any;
     /// see [`Bucket::time_until`].
     ///
-    /// The provided body cannot see a refill rate, so it only answers what
+    /// The answer means the same for every implementation: `None` is "this
+    /// request can never succeed", and `Some(wait)` is an upper bound on the
+    /// wait — `Some(Duration::ZERO)` when it would succeed now.
+    ///
+    /// The provided body cannot see a refill rate, so it answers only what
     /// [`available`](Self::available) and [`capacity`](Self::capacity) can:
-    /// `Some(Duration::ZERO)` when `n` tokens are there now, otherwise `None`
-    /// ("no prediction"). [`Bucket`] overrides it with the exact wait.
+    /// `Some(Duration::ZERO)` when `n` tokens are there now, `None` when `n`
+    /// exceeds the capacity, and otherwise `Some(Duration::MAX)` — "not now,
+    /// and no better bound is known". [`Bucket`] overrides it with the exact
+    /// wait, and never returns `Some(Duration::MAX)`; another implementation
+    /// should override it too.
     ///
     /// # Examples
     ///
@@ -722,7 +729,13 @@ pub trait TokenBucket {
     /// ```
     #[must_use]
     fn time_until(&self, n: u32) -> Option<Duration> {
-        (n == 0 || self.available() >= n).then_some(Duration::ZERO)
+        if n == 0 || self.available() >= n {
+            Some(Duration::ZERO)
+        } else if n > self.capacity() {
+            None
+        } else {
+            Some(Duration::MAX)
+        }
     }
 
     /// Refills the bucket to full; see [`Bucket::reset`].
