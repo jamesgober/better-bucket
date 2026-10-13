@@ -2,7 +2,9 @@
 //!
 //! [`Bucket`] is the lock-free engine (see `engine.rs`) plus an injected
 //! monotonic clock and the instant it was built. Every method that needs the
-//! time reads the clock once and hands the elapsed time to the engine.
+//! time reads the clock once and hands the elapsed time to the engine; every
+//! `*_at` twin takes the reading from the caller instead, so one clock read can
+//! serve many buckets and tests can drive time exactly.
 //!
 //! All mutable state is one `AtomicU64` holding the instant the bucket would
 //! have been empty, in nanoseconds. A grant is a single `compare_exchange_weak`
@@ -256,6 +258,34 @@ impl<C: Clock> Bucket<C> {
         self.core.acquire(n, self.elapsed())
     }
 
+    /// [`acquire`](Self::acquire) at a caller-supplied clock reading.
+    ///
+    /// `now` should come from this bucket's clock (or one that agrees with it).
+    /// A reading earlier than the bucket's construction counts as the
+    /// construction instant; a reading earlier than the last grant simply sees
+    /// fewer tokens. Use it to read the clock once and decide for several
+    /// buckets, or to make a decision at a known instant.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::{Bucket, Decision};
+    /// use clock_lib::{Clock, ManualClock};
+    /// use std::sync::Arc;
+    ///
+    /// let clock = Arc::new(ManualClock::new());
+    /// let a = Bucket::per_second(1).with_clock(Arc::clone(&clock));
+    /// let b = Bucket::per_second(1).with_clock(Arc::clone(&clock));
+    ///
+    /// let now = clock.now(); // one read, two decisions
+    /// assert_eq!(a.acquire_at(1, now), Decision::Allowed);
+    /// assert_eq!(b.acquire_at(1, now), Decision::Allowed);
+    /// ```
+    #[inline]
+    pub fn acquire_at(&self, n: u32, now: Monotonic) -> Decision {
+        self.core.acquire(n, self.elapsed_at(now))
+    }
+
     /// Attempts to take `n` tokens, returning whether it succeeded.
     ///
     /// The one-line convenience over [`acquire`](Self::acquire): equivalent to
@@ -277,6 +307,26 @@ impl<C: Clock> Bucket<C> {
         self.acquire(n).is_allowed()
     }
 
+    /// [`try_acquire`](Self::try_acquire) at a caller-supplied clock reading;
+    /// see [`acquire_at`](Self::acquire_at).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::Bucket;
+    /// use clock_lib::{Clock, SystemClock};
+    ///
+    /// let bucket = Bucket::per_second(2);
+    /// let now = SystemClock::new().now();
+    /// assert!(bucket.try_acquire_at(2, now));
+    /// assert!(!bucket.try_acquire_at(1, now));
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn try_acquire_at(&self, n: u32, now: Monotonic) -> bool {
+        self.acquire_at(n, now).is_allowed()
+    }
+
     /// Returns how many whole tokens are available right now, after lazy refill.
     ///
     /// This is a momentary snapshot; under concurrent acquires it can be stale
@@ -296,6 +346,29 @@ impl<C: Clock> Bucket<C> {
     #[must_use]
     pub fn available(&self) -> u32 {
         self.core.available(self.elapsed())
+    }
+
+    /// [`available`](Self::available) at a caller-supplied clock reading; see
+    /// [`acquire_at`](Self::acquire_at).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::Bucket;
+    /// use clock_lib::{Clock, ManualClock};
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// let clock = Arc::new(ManualClock::new());
+    /// let bucket = Bucket::per_second(10).with_clock(Arc::clone(&clock));
+    /// assert!(bucket.try_acquire(10));
+    /// clock.advance(Duration::from_millis(300));
+    /// assert_eq!(bucket.available_at(clock.now()), 3);
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn available_at(&self, now: Monotonic) -> u32 {
+        self.core.available(self.elapsed_at(now))
     }
 
     /// Returns the bucket's capacity (its burst ceiling), in whole tokens.
@@ -331,6 +404,26 @@ impl<C: Clock> Bucket<C> {
         self.core.config()
     }
 
+    /// Returns the bucket's clock.
+    ///
+    /// Handy for reading the time once and passing it to the `*_at` methods of
+    /// this and other buckets that share the clock.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::Bucket;
+    /// use clock_lib::Clock;
+    ///
+    /// let bucket = Bucket::per_second(5);
+    /// let now = bucket.clock().now();
+    /// assert!(bucket.try_acquire_at(1, now));
+    /// ```
+    #[must_use]
+    pub const fn clock(&self) -> &C {
+        &self.clock
+    }
+
     /// Refills the bucket to full and marks it current as of now.
     ///
     /// Use it to discard accumulated debt and grant a fresh burst — for example at the start of a new billing
@@ -352,11 +445,36 @@ impl<C: Clock> Bucket<C> {
         self.core.reset(self.elapsed());
     }
 
-    /// Elapsed time since construction, from the bucket's own clock. A reading
-    /// from before construction saturates to zero.
+    /// [`reset`](Self::reset) at a caller-supplied clock reading; see
+    /// [`acquire_at`](Self::acquire_at).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::Bucket;
+    /// use clock_lib::Clock;
+    ///
+    /// let bucket = Bucket::per_second(4);
+    /// assert!(bucket.try_acquire(4));
+    /// let now = bucket.clock().now();
+    /// bucket.reset_at(now);
+    /// assert_eq!(bucket.available_at(now), 4);
+    /// ```
+    pub fn reset_at(&self, now: Monotonic) {
+        self.core.reset(self.elapsed_at(now));
+    }
+
+    /// Elapsed time since construction, from the bucket's own clock.
     #[inline]
     fn elapsed(&self) -> Duration {
-        self.clock.now().saturating_duration_since(self.created_at)
+        self.elapsed_at(self.clock.now())
+    }
+
+    /// Elapsed time since construction at a supplied reading. A reading from
+    /// before construction saturates to zero.
+    #[inline]
+    fn elapsed_at(&self, now: Monotonic) -> Duration {
+        now.saturating_duration_since(self.created_at)
     }
 }
 
@@ -424,7 +542,7 @@ mod tests {
     use super::{Bucket, TokenBucket};
     use crate::config::BucketConfig;
     use crate::decision::Decision;
-    use clock_lib::{ManualClock, SystemClock};
+    use clock_lib::{Clock, ManualClock, SystemClock};
     use core::time::Duration;
     use std::sync::Arc;
     use std::thread;
@@ -683,6 +801,23 @@ mod tests {
         assert!(bucket.try_acquire(10));
         let rebuilt = bucket.with_clock(Arc::new(ManualClock::new()));
         assert_eq!(rebuilt.available(), 10);
+    }
+
+    #[test]
+    fn test_reading_before_construction_is_clamped() {
+        let clock = Arc::new(ManualClock::new());
+        let before = clock.now();
+        clock.advance(Duration::from_secs(1));
+        let config = BucketConfig::new(4, 4, Duration::from_secs(1), 1).unwrap();
+        let bucket = Bucket::with_config_and_clock(config, Arc::clone(&clock));
+        assert_eq!(bucket.available_at(before), 1);
+    }
+
+    #[test]
+    fn test_clock_accessor_returns_the_injected_clock() {
+        let (clock, bucket) = manual_bucket(1);
+        clock.advance(Duration::from_secs(9));
+        assert_eq!(bucket.clock().offset(), Duration::from_secs(9));
     }
 
     #[test]
