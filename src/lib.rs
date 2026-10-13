@@ -97,6 +97,7 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![forbid(unsafe_code)]
 #![deny(warnings)]
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -111,6 +112,7 @@
 #![deny(clippy::dbg_macro)]
 #![deny(clippy::unreachable)]
 #![deny(clippy::undocumented_unsafe_blocks)]
+#![deny(clippy::missing_safety_doc)]
 // Without `clock`, links to `Bucket` and `TokenBucket` in shared docs have no
 // target; the items they describe are simply absent from that build.
 #![cfg_attr(not(feature = "clock"), allow(rustdoc::broken_intra_doc_links))]
