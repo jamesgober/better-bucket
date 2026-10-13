@@ -25,6 +25,12 @@ use crate::error::BucketError;
 /// [`Bucket::capacity`](crate::Bucket::capacity) always equals
 /// [`capacity`](Self::capacity).
 ///
+/// With the `serde` feature, `BucketConfig` implements `Serialize` and
+/// `Deserialize`. Deserialization runs the same validation as `new`, so a
+/// configuration file cannot smuggle in a zero capacity or period; unknown
+/// fields are rejected. `refill_period` uses serde's standard `Duration` form
+/// (`{ secs, nanos }`).
+///
 /// # Examples
 ///
 /// ```
@@ -38,6 +44,8 @@ use crate::error::BucketError;
 /// # Ok::<(), better_bucket::BucketError>(())
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "RawConfig"))]
 pub struct BucketConfig {
     capacity: u32,
     refill_amount: u32,
@@ -162,6 +170,32 @@ impl BucketConfig {
             refill_period,
             initial,
         }
+    }
+}
+
+/// The unvalidated wire form of a [`BucketConfig`]; deserialization goes
+/// through [`BucketConfig::new`] via `TryFrom`.
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConfig {
+    capacity: u32,
+    refill_amount: u32,
+    refill_period: Duration,
+    initial: u32,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<RawConfig> for BucketConfig {
+    type Error = BucketError;
+
+    fn try_from(raw: RawConfig) -> Result<Self, Self::Error> {
+        Self::new(
+            raw.capacity,
+            raw.refill_amount,
+            raw.refill_period,
+            raw.initial,
+        )
     }
 }
 

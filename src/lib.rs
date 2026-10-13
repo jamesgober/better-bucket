@@ -90,6 +90,7 @@
 //! |---------|---------|-------------|
 //! | `std`   | yes     | Standard library. Off → `no_std`; [`BucketCore`] and the config/decision/error types remain. |
 //! | `clock` | yes     | [`Bucket`] and the [`clock-lib`](https://crates.io/crates/clock-lib) time source, plus a mockable clock for deterministic tests. Implies `std`; brings `error_forge::ForgeError` for [`BucketError`]. |
+//! | `serde` | no      | `Serialize` / validating `Deserialize` for [`BucketConfig`]. |
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]

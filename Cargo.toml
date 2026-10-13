@@ -95,6 +95,10 @@ std = ["clock-lib?/std"]
 # for `BucketError`.
 clock = ["std", "dep:clock-lib", "dep:error-forge"]
 
+# `serde::Serialize` / `Deserialize` for `BucketConfig`. Deserialization runs
+# the same validation as `BucketConfig::new`. Off by default; no_std-compatible.
+serde = ["dep:serde"]
+
 # Benchmark-only: pulls in `governor` for the comparative benchmark
 # (`cargo bench --features comparison --bench comparison`). Never enabled in a
 # normal build, so it does not affect the crate's dependency footprint or MSRV.
@@ -115,6 +119,10 @@ clock-lib = { version = "1.0", optional = true, default-features = false }
 # used; `BucketError` is hand-written so every variant is documented.
 error-forge = { version = "1.0", optional = true }
 
+# Config-file support for `BucketConfig`, behind the `serde` feature. derive
+# only, no std, so it works in no_std builds too.
+serde = { version = "1.0.200", optional = true, default-features = false, features = ["derive"] }
+
 # Benchmark-only incumbent, behind the `comparison` feature. Used solely by the
 # `comparison` bench to produce the head-to-head numbers in docs/BENCHMARKS.md.
 governor = { version = "0.10", optional = true }
@@ -124,8 +132,10 @@ governor = { version = "0.10", optional = true }
 # DEV DEPENDENCIES
 # #################################
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
-proptest  = "1"
+criterion  = { version = "0.5", features = ["html_reports"] }
+proptest   = "1"
+# Round-trip tests for the `serde` feature.
+serde_json = "1"
 
 # `loom` is pulled in only under `cfg(loom)` model-checking builds
 # (`RUSTFLAGS="--cfg loom" cargo test`). It is a regular (not dev) dependency
