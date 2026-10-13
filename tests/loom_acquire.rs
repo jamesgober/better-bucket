@@ -186,31 +186,41 @@ fn loom_core_with_caller_time_never_over_grants() {
 
 #[test]
 fn loom_reset_racing_acquire_is_bounded() {
-    // `reset` grants one fresh burst by design, so with one reset the total is
-    // bounded by two bursts — and the state must never corrupt.
+    // `reset` grants one fresh burst by design, so with one reset everything
+    // handed out plus everything left is bounded by two bursts: whatever was
+    // granted before the reset, plus the full bucket it leaves behind. Two
+    // racing acquirers on a one-token bucket make the bound depend on the CAS:
+    // with a lost update (two grants charged as one) the total exceeds it.
     loom::model(|| {
         let clock = std::sync::Arc::new(LoomClock::new(1, Duration::from_millis(1)));
         let bucket = loom::sync::Arc::new(Bucket::with_config_and_clock(
-            per_second(2, 2),
+            per_second(1, 1),
             std::sync::Arc::clone(&clock),
         ));
 
-        let a = loom::sync::Arc::clone(&bucket);
-        let b = loom::sync::Arc::clone(&bucket);
-        let advancing = std::sync::Arc::clone(&clock);
+        let acquirer = |bucket: loom::sync::Arc<Bucket<std::sync::Arc<LoomClock>>>| {
+            loom::thread::spawn(move || u32::from(bucket.try_acquire(1)))
+        };
+        let t1 = acquirer(loom::sync::Arc::clone(&bucket));
+        let t2 = acquirer(loom::sync::Arc::clone(&bucket));
+        let resetter = {
+            let bucket = loom::sync::Arc::clone(&bucket);
+            let advancing = std::sync::Arc::clone(&clock);
+            loom::thread::spawn(move || {
+                advancing.advance();
+                bucket.reset();
+            })
+        };
+        let granted = t1.join().unwrap() + t2.join().unwrap();
+        resetter.join().unwrap();
 
-        let t1 = loom::thread::spawn(move || {
-            u32::from(a.try_acquire(2)) * 2 + u32::from(a.try_acquire(1))
-        });
-        let t2 = loom::thread::spawn(move || {
-            advancing.advance();
-            b.reset();
-        });
-        let granted = t1.join().unwrap();
-        t2.join().unwrap();
-
-        assert!(granted <= 4, "over-grant: {granted} > 2 bursts");
-        assert!(bucket.available() <= bucket.capacity());
+        // 1 ms at 1/s accrues 0.001 tokens: no whole token beyond the bursts.
+        let left = bucket.available();
+        assert!(left <= bucket.capacity());
+        assert!(
+            granted + left <= 2,
+            "over-grant: {granted} granted + {left} left > 2 bursts"
+        );
     });
 }
 

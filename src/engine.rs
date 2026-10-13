@@ -220,7 +220,7 @@ impl Core {
             config.refill_period(),
         );
         let period = config.refill_period();
-        let core = Self {
+        let mut core = Self {
             state: AtomicU64::new(0),
             rate_frac: rate.rate_frac,
             period_secs: period.as_secs(),
@@ -237,9 +237,10 @@ impl Core {
                 tokens_granted: AtomicU64::new(0),
             },
         };
+        // The atomic is created holding the initial state, so no thread can
+        // ever observe a placeholder value.
         let initial = core.cost(config.initial().min(config.capacity()));
-        core.state
-            .store(core.units(now).saturating_sub(initial), Ordering::Relaxed);
+        core.state = AtomicU64::new(core.units(now).saturating_sub(initial));
         core
     }
 
@@ -556,7 +557,11 @@ impl Core {
 
     /// Refills to capacity as of `now`, cancelling any outstanding reservation.
     pub(crate) fn reset(&self, now: Duration) {
-        self.state.store(
+        // A swap rather than a plain store: the same effect, but every write to
+        // the word is then a read-modify-write, which `loom` orders exactly.
+        // (It models the order between plain stores and RMWs only partially,
+        // and would report races a real CPU cannot produce.)
+        let _previous = self.state.swap(
             self.units(now).saturating_sub(self.burst()),
             Ordering::Relaxed,
         );
