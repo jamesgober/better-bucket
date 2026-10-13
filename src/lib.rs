@@ -164,6 +164,16 @@ pub use crate::metrics::BucketMetrics;
 /// ```
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+// Compile and run the Rust examples in the README and the API reference as
+// doctests, so the documentation cannot drift from the code.
+#[cfg(all(doctest, feature = "clock"))]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
+#[cfg(all(doctest, feature = "clock", feature = "metrics"))]
+#[doc = include_str!("../docs/API.md")]
+struct ApiReferenceDoctests;
+
 #[cfg(test)]
 mod tests {
     use super::VERSION;
