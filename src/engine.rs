@@ -311,16 +311,22 @@ impl Core {
         let floor = now_u.saturating_sub(self.burst());
         let mut current = self.state.load(Ordering::Relaxed);
         loop {
-            // Clamp to "full" (z no earlier than now − burst), then charge.
-            let next = current.max(floor).saturating_add(cost);
-            if next > now_u {
-                // Denied: report the wait for the shortfall to accrue. No write,
-                // so a denied request never contends with a granting one.
-                self.record_denied();
-                return Decision::Denied {
-                    retry_after: self.wait_until(next, now).unwrap_or(Duration::MAX),
-                };
-            }
+            // Clamp to "full" (z no earlier than now − burst), then charge. An
+            // overflow means the charge lands past the end of the clock's
+            // range: it can never be covered, so it fails closed.
+            let next = match current.max(floor).checked_add(cost) {
+                Some(next) if next <= now_u => next,
+                overflowed_or_short => {
+                    // Denied: report the wait for the shortfall to accrue. No
+                    // write, so a denied request never contends with a granting
+                    // one.
+                    self.record_denied();
+                    let retry_after = overflowed_or_short
+                        .and_then(|next| self.wait_until(next, now))
+                        .unwrap_or(Duration::MAX);
+                    return Decision::Denied { retry_after };
+                }
+            };
             // Relaxed is sufficient: the decision depends only on this one word,
             // and the CAS gives the read-modify-write atomicity the
             // no-over-grant contract needs. `now` needs no ordering against
@@ -421,7 +427,7 @@ impl Core {
             .state
             .load(Ordering::Relaxed)
             .max(now_u.saturating_sub(self.burst()))
-            .saturating_add(self.cost(n));
+            .checked_add(self.cost(n))?;
         if next <= now_u {
             Some(Duration::ZERO)
         } else {
@@ -445,7 +451,12 @@ impl Core {
         let floor = now_u.saturating_sub(self.burst());
         let mut current = self.state.load(Ordering::Relaxed);
         loop {
-            let next = current.max(floor).saturating_add(cost);
+            // As in `acquire`, a charge past the end of the clock's range can
+            // never be covered: fail closed.
+            let Some(next) = current.max(floor).checked_add(cost) else {
+                self.record_denied();
+                return None;
+            };
             let wait = if next <= now_u {
                 Some(Duration::ZERO)
             } else {
@@ -1061,15 +1072,79 @@ mod tests {
     }
 
     #[test]
-    fn test_core_survives_centuries_and_saturates_safely() {
+    fn test_core_survives_centuries() {
         let bucket = core(10, 10, ms(1_000), 0);
         let century = Duration::from_secs(100 * 365 * 86_400);
         assert_eq!(bucket.available_at(century), 10);
         assert!(bucket.try_acquire_at(10, century));
         assert_eq!(bucket.available_at(century), 0);
-        // Past the ~438-year horizon the clock stops: no panic, no wrap.
-        let _ = bucket.try_acquire_at(1, Duration::MAX);
-        assert!(bucket.available_at(Duration::MAX) <= 10);
+    }
+
+    /// Hammers one instant and returns the tokens granted and whether a
+    /// zero-wait reservation of the capacity still succeeded afterwards.
+    fn hammer_at(bucket: &BucketCore, now: Duration) -> (u32, bool) {
+        let mut granted = 0_u32;
+        for _ in 0..1_000 {
+            if bucket.try_acquire_at(1, now) {
+                granted += 1;
+            }
+            granted += bucket.acquire_up_to_at(1, now);
+        }
+        let reserved = bucket
+            .reserve_at(bucket.capacity(), Duration::ZERO, now)
+            .is_some();
+        (granted, reserved)
+    }
+
+    #[test]
+    fn test_core_saturated_clock_fails_closed() {
+        // Rates near one unit per nanosecond saturate the unit clock before the
+        // nanosecond reading does: 0.9 units/ns, 7/8 units/ns, and the fast
+        // regime. Past the horizon the clock is frozen, so a bucket can hand
+        // out what it holds and nothing more — never an unbounded stream.
+        let year = 365 * 86_400;
+        for (amount, period) in [
+            (900_000_000, Duration::from_secs(1)),
+            (7, Duration::from_nanos(8)),
+            (u32::MAX, Duration::from_secs(1)),
+            (1, Duration::from_secs(1)),
+        ] {
+            for now in [
+                Duration::MAX,
+                Duration::from_secs(u64::MAX),
+                Duration::from_secs(450 * year),
+                Duration::from_secs(500 * year),
+            ] {
+                let bucket = core(10, amount, period, 10);
+                let (granted, reserved) = hammer_at(&bucket, now);
+                assert!(
+                    granted <= 10,
+                    "{amount}/{period:?} at {now:?}: granted {granted}"
+                );
+                assert!(!reserved || granted == 0, "{amount}/{period:?} at {now:?}");
+                assert!(bucket.available_at(now) <= 10);
+                // At `Duration::MAX` every clock is frozen: once drained, the
+                // wait is "never".
+                if now == Duration::MAX && granted == 10 {
+                    assert_eq!(bucket.time_until_at(1, now), None);
+                    assert_eq!(bucket.acquire_at(1, now).retry_after(), Some(Duration::MAX));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_core_far_future_reading_never_mints_tokens_later() {
+        // A garbage `now` past the horizon spends at most the capacity; later
+        // sane readings see an empty bucket, never extra tokens.
+        let bucket = core(5, 900_000_000, Duration::from_secs(1), 5);
+        let (granted, _) = hammer_at(&bucket, Duration::MAX);
+        assert!(granted <= 5);
+        for sane in [T0, ms(1), Duration::from_secs(3_600)] {
+            assert!(!bucket.try_acquire_at(1, sane));
+            assert_eq!(bucket.acquire_up_to_at(5, sane), 0);
+            assert!(bucket.reserve_at(1, Duration::MAX, sane).is_none());
+        }
     }
 
     #[test]
