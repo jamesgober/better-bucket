@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use better_bucket::{Bucket, BucketConfig, Decision};
 use clock_lib::ManualClock;
@@ -41,13 +41,30 @@ fn test_request_at_u32_max_never_panics_and_is_denied_forever() {
 
 #[test]
 fn test_capacity_at_u32_max_constructs_and_works() {
-    // The packed representation clamps capacity; construction must not panic and
-    // the bucket must still grant.
+    // Capacity is exact for every u32 — no clamp — and the bucket still grants.
     let bucket = Bucket::per_second(u32::MAX);
-    assert!(bucket.capacity() > 0);
-    assert!(bucket.capacity() <= 4_294_967); // ~u32::MAX millitokens / 1000
+    assert_eq!(bucket.capacity(), u32::MAX);
+    assert_eq!(bucket.capacity(), bucket.config().capacity());
     assert!(bucket.try_acquire(1));
     assert!(bucket.available() <= bucket.capacity());
+}
+
+#[test]
+fn test_capacity_above_old_clamp_is_honoured() {
+    // 1.0.0 clamped capacity to ~4.29 M tokens and then refused an in-capacity
+    // request forever. Every configured capacity is now exact.
+    let clock = Arc::new(ManualClock::new());
+    let bucket = Bucket::builder()
+        .capacity(10_000_000)
+        .refill(10_000_000, Duration::from_secs(1))
+        .build()
+        .unwrap()
+        .with_clock(Arc::clone(&clock));
+    assert_eq!(bucket.capacity(), 10_000_000);
+    assert_eq!(bucket.config().capacity(), 10_000_000);
+    assert_eq!(bucket.acquire(5_000_000), Decision::Allowed);
+    assert_eq!(bucket.available(), 5_000_000);
+    assert_eq!(Bucket::per_second(5_000_000).capacity(), 5_000_000);
 }
 
 #[test]
@@ -182,10 +199,14 @@ fn test_enormous_single_advance_clamps_without_wrapping() {
 
 #[test]
 fn test_concurrent_acquire_and_reset_stay_in_bounds() {
-    // Hammer one bucket while another thread repeatedly resets it. `reset` is a
-    // deliberate fresh-burst, so total grants are unbounded — but the bucket
-    // must never panic, deadlock, or report more than capacity available.
-    let bucket = Arc::new(Bucket::per_second(100));
+    // Hammer one real-clock bucket while another thread repeatedly resets it.
+    // Each `reset` grants at most one fresh burst, so the total is bounded by
+    // (resets + 1) bursts plus the refill over the run — and the bucket must
+    // never panic, deadlock, or report more than capacity available.
+    const RATE: u32 = 100;
+    const RESETS: u64 = 2_000;
+    let start = Instant::now();
+    let bucket = Arc::new(Bucket::per_second(RATE));
     let granted = Arc::new(AtomicU64::new(0));
 
     let mut handles = Vec::new();
@@ -204,7 +225,7 @@ fn test_concurrent_acquire_and_reset_stay_in_bounds() {
     let resetter = {
         let bucket = Arc::clone(&bucket);
         thread::spawn(move || {
-            for _ in 0..2_000 {
+            for _ in 0..RESETS {
                 bucket.reset();
             }
         })
@@ -214,5 +235,11 @@ fn test_concurrent_acquire_and_reset_stay_in_bounds() {
         h.join().unwrap();
     }
     resetter.join().unwrap();
+    let elapsed = start.elapsed();
     assert!(bucket.available() <= bucket.capacity());
+
+    let rate = u128::from(RATE);
+    let ceiling = rate * u128::from(RESETS + 1) + rate * elapsed.as_nanos() / 1_000_000_000 + 1;
+    let granted = u128::from(granted.load(Ordering::Relaxed));
+    assert!(granted <= ceiling, "granted {granted} > ceiling {ceiling}");
 }

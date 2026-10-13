@@ -1,9 +1,11 @@
 //! Property-based invariant suite for the token bucket.
 //!
-//! These properties encode the crate's two safety contracts and run against the
-//! `0.2` simple implementation. They are the same invariants the lock-free
-//! `0.3` core must continue to satisfy, so this file moves forward unchanged
-//! into that milestone.
+//! These properties encode the crate's two safety contracts — tokens stay in
+//! `[0, capacity]`, and grants never exceed the initial fill plus the accrued
+//! refill — plus the honesty of the retry hint, exercised through `Bucket` and an
+//! injected `ManualClock`. The clock-free engine has its own, wider property
+//! suite in `core_properties.rs` (arbitrary rates, backward time, refunds,
+//! reservations).
 //!
 //! Gated on `clock`: without it there is no `Bucket` to exercise.
 
