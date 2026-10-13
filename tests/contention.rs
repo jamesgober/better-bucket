@@ -68,6 +68,92 @@ fn thread_counts() -> Vec<usize> {
         .collect()
 }
 
+/// How each worker spends its loop in the configuration matrix.
+#[derive(Debug, Clone, Copy)]
+enum Mode {
+    Acquire,
+    UpTo,
+    ReserveNow,
+    Mixed,
+}
+
+/// Like [`hammer`], with a choice of operation. A zero-wait reservation and a
+/// partial grant both count only what they took.
+fn hammer_mode(
+    config: BucketConfig,
+    threads: usize,
+    mode: Mode,
+    run_for: Duration,
+) -> (u64, Duration) {
+    let start = Instant::now();
+    let bucket = Arc::new(Bucket::from_config(config));
+    let granted = Arc::new(AtomicU64::new(0));
+    let barrier = Arc::new(Barrier::new(threads));
+    let handles: Vec<_> = (0..threads)
+        .map(|worker| {
+            let bucket = Arc::clone(&bucket);
+            let granted = Arc::clone(&granted);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let began = Instant::now();
+                let mut local = 0_u64;
+                let mut round = worker;
+                while began.elapsed() < run_for {
+                    round += 1;
+                    let pick = match mode {
+                        Mode::Mixed => round % 3,
+                        Mode::Acquire => 0,
+                        Mode::UpTo => 1,
+                        Mode::ReserveNow => 2,
+                    };
+                    local += match pick {
+                        0 => u64::from(bucket.try_acquire(1)),
+                        1 => u64::from(bucket.acquire_up_to(3)),
+                        _ => u64::from(bucket.reserve(2, Duration::ZERO).is_some()) * 2,
+                    };
+                }
+                let _ = granted.fetch_add(local, Ordering::Relaxed);
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    (granted.load(Ordering::Relaxed), start.elapsed())
+}
+
+#[test]
+fn test_real_clock_configuration_matrix_never_exceeds_the_ceiling() {
+    // The verifier's matrix, shortened: fast, slow, tiny, huge, and
+    // non-integer-period configurations under every operation mix.
+    let day = Duration::from_secs(86_400);
+    let configs = [
+        (1_000, 1_000, Duration::from_secs(1)),
+        (1, 1, Duration::from_secs(1)),
+        (1, 1_000_000, Duration::from_secs(1)),
+        (5, 1, Duration::from_secs(3_600)),
+        (10, 3_000_000_000, Duration::from_secs(1)),
+        (997, 6_001, Duration::from_secs(1)),
+        (100, 7, Duration::from_millis(3)),
+        (1_000_000, 1_000_000, day),
+    ];
+    for (capacity, amount, period) in configs {
+        let config = BucketConfig::new(capacity, amount, period, capacity).unwrap();
+        for mode in [Mode::Acquire, Mode::UpTo, Mode::ReserveNow, Mode::Mixed] {
+            for threads in thread_counts().into_iter().take(3) {
+                let (granted, elapsed) =
+                    hammer_mode(config, threads, mode, Duration::from_millis(30));
+                let limit = ceiling(capacity, amount, period, elapsed);
+                assert!(
+                    u128::from(granted) <= limit,
+                    "{capacity}@{amount}/{period:?} {mode:?} x{threads}: {granted} > {limit}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn test_real_clock_contention_never_exceeds_the_rate_ceiling() {
     // 1000/s, capacity 1000: 1.0.0 granted ~89,000 here with just 2 threads.

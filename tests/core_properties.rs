@@ -63,19 +63,43 @@ impl Setup {
     }
 }
 
+/// Every regime the engine distinguishes: small and `u32`-sized capacities
+/// (the capacity-limited unit), and rates from one per month to ~4 × 10^18 per
+/// second (sub-microsecond periods with huge amounts are the multi-token-unit
+/// regime above ~4.3 × 10^9 tokens/second).
 fn setups() -> impl Strategy<Value = Setup> {
     (
-        1_u32..=5_000,
-        1_u32..=5_000,
-        1_000_u64..=10_000_000_000,
+        prop_oneof![1_u32..=5_000, 1_u32..=u32::MAX],
+        prop_oneof![1_u32..=5_000, 1_u32..=u32::MAX],
+        prop_oneof![
+            1_u64..=999,
+            1_000_u64..=10_000_000_000,
+            86_400_000_000_000_u64..=30 * 86_400_000_000_000,
+        ],
         any::<u32>(),
     )
         .prop_map(|(capacity, amount, period_ns, initial)| Setup {
             capacity,
             amount,
             period_ns,
-            initial: initial % (capacity + 1),
+            initial: if capacity == u32::MAX {
+                initial
+            } else {
+                initial % (capacity + 1)
+            },
         })
+}
+
+/// Setups whose grants are exact: every rate up to ~4.3 × 10^9 tokens/second.
+/// Faster ones are slowed to that limit by lengthening the period.
+fn exact_setups() -> impl Strategy<Value = Setup> {
+    setups().prop_map(|mut setup| {
+        let min_period = (u128::from(setup.amount) * 10).div_ceil(43);
+        setup.period_ns = setup
+            .period_ns
+            .max(u64::try_from(min_period).unwrap_or(u64::MAX));
+        setup
+    })
 }
 
 /// One operation: a raw request size (scaled to the capacity by `request`) and
@@ -162,7 +186,7 @@ proptest! {
     /// partial grants, and refunds of what was taken.
     #[test]
     fn core_frozen_clock_conserves_every_token(
-        setup in setups(),
+        setup in exact_setups(),
         steps in proptest::collection::vec((0_u8..3, 1_u32..=600), 0..96),
     ) {
         let t = at(1_234_567);
@@ -216,6 +240,10 @@ proptest! {
         let predicted = bucket.time_until_at(n, at(start));
         match bucket.acquire_at(n, at(start)) {
             Decision::Allowed => prop_assert_eq!(predicted, Some(Duration::ZERO)),
+            Decision::Denied { retry_after } if retry_after == Duration::MAX => {
+                // "Never" (the wait outlasts the clock): `time_until` says None.
+                prop_assert_eq!(predicted, None);
+            }
             Decision::Denied { retry_after } => {
                 prop_assert_eq!(predicted, Some(retry_after));
                 let due = at(start) + retry_after;
