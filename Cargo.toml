@@ -110,6 +110,11 @@ serde = ["dep:serde"]
 # no atomic increment).
 metrics = []
 
+# Use `portable-atomic` for the 64-bit state word. Only needed on targets with
+# no native 64-bit atomics (e.g. thumbv7em, 32-bit MIPS/PowerPC); on every other
+# target it compiles to the same native instructions. Off by default.
+portable-atomic = ["dep:portable-atomic"]
+
 # Benchmark-only: pulls in `governor` for the comparative benchmark
 # (`cargo bench --features comparison --bench comparison`). Never enabled in a
 # normal build, so it does not affect the crate's dependency footprint or MSRV.
@@ -134,6 +139,11 @@ error-forge = { version = "1.0.2", optional = true }
 # Config-file support for `BucketConfig`, behind the `serde` feature. derive
 # only, no std, so it works in no_std builds too.
 serde = { version = "1.0.200", optional = true, default-features = false, features = ["derive"] }
+
+# 64-bit atomics on targets without them, behind the `portable-atomic` feature.
+# `fallback` provides the lock-based implementation where no native 64-bit CAS
+# exists; elsewhere the crate is a zero-cost re-export of the native atomics.
+portable-atomic = { version = "1.6", optional = true, default-features = false, features = ["fallback"] }
 
 # Benchmark-only incumbent, behind the `comparison` feature. Used solely by the
 # `comparison` bench to produce the head-to-head numbers in docs/BENCHMARKS.md.

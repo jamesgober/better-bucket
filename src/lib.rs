@@ -93,6 +93,7 @@
 //! | `forge` | yes (via `clock`) | `error_forge::ForgeError` for [`BucketError`]. |
 //! | `serde` | no      | `Serialize` / validating `Deserialize` for [`BucketConfig`]. |
 //! | `metrics` | no    | Allowed / denied / granted-token counters on every bucket. Zero cost when off. |
+//! | `portable-atomic` | no | Use [`portable-atomic`](https://crates.io/crates/portable-atomic) for the state word, for targets without native 64-bit atomics (e.g. Cortex-M). |
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -124,8 +125,9 @@ mod bucket;
 mod builder;
 mod config;
 mod decision;
-// The lock-free engine needs a native 64-bit atomic.
-#[cfg(target_has_atomic = "64")]
+// The lock-free engine needs a 64-bit atomic: native where the target has one,
+// or `portable-atomic` where it does not.
+#[cfg(any(target_has_atomic = "64", feature = "portable-atomic"))]
 mod engine;
 mod error;
 #[cfg(feature = "metrics")]
@@ -137,7 +139,7 @@ pub use crate::bucket::{Bucket, TokenBucket};
 pub use crate::builder::BucketBuilder;
 pub use crate::config::BucketConfig;
 pub use crate::decision::Decision;
-#[cfg(target_has_atomic = "64")]
+#[cfg(any(target_has_atomic = "64", feature = "portable-atomic"))]
 pub use crate::engine::BucketCore;
 pub use crate::error::BucketError;
 #[cfg(feature = "metrics")]

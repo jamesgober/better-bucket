@@ -49,10 +49,12 @@
 
 use core::time::Duration;
 
-#[cfg(not(loom))]
+#[cfg(all(not(loom), not(feature = "portable-atomic")))]
 use core::sync::atomic::{AtomicU64, Ordering};
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicU64, Ordering};
+#[cfg(all(not(loom), feature = "portable-atomic"))]
+use portable_atomic::{AtomicU64, Ordering};
 
 use crate::config::BucketConfig;
 use crate::decision::Decision;
