@@ -1,4 +1,6 @@
-//! The lock-free accounting engine and its clock-free public face, `BucketCore`.
+//! The accounting engine and its clock-free public face, `BucketCore`. Lock-free
+//! on every target with native 64-bit atomics; see the `portable-atomic` note
+//! on [`BucketCore`] for the others.
 //!
 //! Everything that decides a grant lives here. [`Bucket`](crate::Bucket) is
 //! this engine plus a clock; [`BucketCore`] is this engine with the caller
@@ -601,8 +603,8 @@ impl Core {
 
 /// A token bucket that takes the current time from the caller.
 ///
-/// `BucketCore` is the same lock-free engine as [`Bucket`](crate::Bucket),
-/// without a clock. Every time-dependent method takes `now`: the time elapsed
+/// `BucketCore` is the same engine as [`Bucket`](crate::Bucket), without a
+/// clock. Every time-dependent method takes `now`: the time elapsed
 /// since an epoch of your choosing (boot, a timer peripheral's zero, a test's
 /// start), the same epoch for every call on one bucket. That makes it the
 /// `no_std` path — it needs only `core` and a 64-bit atomic — and the
@@ -614,7 +616,21 @@ impl Core {
 ///
 /// `now` should not run backwards. If it does (a stale reading, a reset timer),
 /// the bucket simply sees fewer tokens until time catches up again — it never
-/// grants more because of it.
+/// grants more because of it. A reading past the end of the bucket's clock
+/// range (at least a century; `Duration::MAX`, a garbage timestamp) is treated
+/// as the frozen end of time: it can spend at most the tokens on hand, and the
+/// bucket then looks empty at any sane reading. Validate untrusted timestamps.
+///
+/// # Atomics
+///
+/// The state is one 64-bit atomic, so the bucket is lock-free on every target
+/// with native 64-bit atomics. With the `portable-atomic` feature on a target
+/// without them (e.g. `thumbv7em-none-eabihf`), portable-atomic's default
+/// fallback guards the word with a global spinlock: not lock-free, and not
+/// safe to use from an interrupt handler, which can spin forever on a lock the
+/// interrupted code holds. Firmware that touches a bucket from interrupt
+/// context enables portable-atomic's `unsafe-assume-single-core` or
+/// `critical-section` feature in the final binary.
 ///
 /// # Examples
 ///

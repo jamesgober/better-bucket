@@ -1,6 +1,6 @@
 //! The clock-driven token bucket and the `TokenBucket` trait.
 //!
-//! [`Bucket`] is the lock-free engine (see `engine.rs`) plus an injected
+//! [`Bucket`] is the accounting engine (see `engine.rs`) plus an injected
 //! monotonic clock and the instant it was built. Every method that needs the
 //! time reads the clock once and hands the elapsed time to the engine; every
 //! `*_at` twin takes the reading from the caller instead, so one clock read can
@@ -9,8 +9,8 @@
 //! All mutable state is one `AtomicU64` holding the instant the bucket would
 //! have been empty, in nanoseconds. A grant is a single `compare_exchange_weak`
 //! that moves that instant forward; a stale or backward clock reading can only
-//! see fewer tokens, never more. Time never wraps (the range is ~438 years) and
-//! capacity is exact up to `u32::MAX`.
+//! see fewer tokens, never more. Time never wraps (the range is at least a
+//! century) and capacity is exact up to `u32::MAX`.
 
 use core::time::Duration;
 
@@ -37,7 +37,8 @@ const fn tier1_config(capacity: u32, amount: u32, period: Duration, initial: u32
 /// A token bucket: a counter that refills over time and grants tokens on demand.
 ///
 /// A bucket holds up to its capacity in tokens, accrues more at a fixed rate,
-/// and hands them out when asked. The hot path is **lock-free** — a single
+/// and hands them out when asked. The hot path is **lock-free** on every target
+/// with native 64-bit atomics — a single
 /// `compare_exchange_weak` on one atomic word — and **allocation-free**.
 /// Refill is **lazy**: there is no background thread or timer, the token count
 /// is brought current from the monotonic clock the instant you call
@@ -57,18 +58,21 @@ const fn tier1_config(capacity: u32, amount: u32, period: Duration, initial: u32
 /// Over any window of time, under any interleaving of concurrent callers, the
 /// tokens granted never exceed the capacity plus what the configured rate
 /// accrues over that window. The only slack is the bucket's resolution: a token
-/// may be granted a few nanoseconds before it is exactly due. A stale or
-/// non-monotonic clock reading can only cause a denial, never an extra grant.
-/// [`reset`](Self::reset) and [`refund`](Self::refund) deliberately add tokens
-/// and are outside that bound.
+/// may be granted a few nanoseconds before it is exactly due (or up to 2^-28 of
+/// a token early, for a bucket whose time to fill exceeds ~36 years). A stale
+/// or non-monotonic clock reading can only cause a denial, never an extra
+/// grant. [`reset`](Self::reset) and [`refund`](Self::refund) deliberately add
+/// tokens and are outside that bound; tokens taken by
+/// [`reserve`](Self::reserve) count at the end of their returned wait.
 ///
 /// # Limits
 ///
-/// Capacity is exact for every `u32`. Time is tracked in nanoseconds since
-/// construction and never wraps; the clock range is ~438 years, after which the
-/// bucket stops refilling (it never over-grants). A bucket whose time to fill
-/// from empty exceeds ~36.5 years tracks time in coarser ticks, which only
-/// matters at that scale. `retry_after` and [`time_until`](Self::time_until)
+/// Capacity is exact for every `u32`, and grants are exact for every rate up to
+/// ~4.3 × 10^9 tokens/second (faster buckets round each grant up to a
+/// multi-token unit). Time is tracked in nanoseconds since construction and
+/// never wraps; the clock range is at least ~438 years (~100 years at 10^9
+/// tokens/second and above), after which the clock is frozen: the bucket grants
+/// at most what it still holds and then denies. `retry_after` and [`time_until`](Self::time_until)
 /// are rounded up to the millisecond. A plain token bucket has no queue, so a
 /// large request can be starved by a stream of small ones; use
 /// [`reserve`](Self::reserve) where that matters.
@@ -920,8 +924,8 @@ mod tests {
 
     #[test]
     fn test_sub_millisecond_period_still_refills() {
-        // 5 tokens per 200µs ⇒ 25 tokens/ms. The millisecond tick is coarse but
-        // the rate is computed from nanoseconds, so a full ms refills fully.
+        // 5 tokens per 200µs ⇒ 25 tokens/ms: a full millisecond refills the
+        // bucket to capacity.
         let clock = Arc::new(ManualClock::new());
         let bucket =
             Bucket::per_duration(5, Duration::from_micros(200)).with_clock(Arc::clone(&clock));

@@ -51,7 +51,7 @@
 
 ```toml
 [dependencies]
-better-bucket = "1"
+better-bucket = "1.1"
 ```
 
 `no_std` build — [`BucketCore`](#the-no_std-core-bucketcore) with
@@ -61,10 +61,10 @@ caller-supplied time, plus `BucketConfig`, `BucketBuilder::build_config`,
 
 ```toml
 [dependencies]
-better-bucket = { version = "1", default-features = false }
+better-bucket = { version = "1.1", default-features = false }
 
 # Targets without native 64-bit atomics (e.g. Cortex-M):
-better-bucket = { version = "1", default-features = false, features = ["portable-atomic"] }
+better-bucket = { version = "1.1", default-features = false, features = ["portable-atomic"] }
 ```
 
 MSRV is **1.85** (Rust 2024 edition).
@@ -76,14 +76,18 @@ in exact token units (see [`DESIGN.md`](DESIGN.md)). Consequences:
 
 - Capacity is exact for every `u32`; `capacity()` always equals
   `config().capacity()`.
-- Time is tracked in nanoseconds and **never wraps**. The clock saturates after
-  at least ~438 years, after which the bucket stops refilling.
+- Time is tracked in nanoseconds and **never wraps**. The bucket's clock
+  saturates after at least ~438 years below 10^9 tokens/second (~100 years
+  above). Past that it is frozen: the bucket grants at most what it still holds
+  and then denies (a charge past the end of the range fails closed). A
+  caller-supplied reading past the range — `Duration::MAX`, say — is that frozen
+  instant, so validate untrusted timestamps before passing them in.
 - `retry_after` and `time_until` are reported at **millisecond** resolution,
   rounded up, so waiting the reported time is always enough.
-- For rates below 10^9 tokens/second every grant is exact; faster buckets
+- For every rate up to ~4.3 × 10^9 tokens/second (every `u32` amount per
+  second) every grant is exact; faster buckets, which need a sub-second period,
   count in multi-token units and round each grant up to a whole unit.
-- The only other rounding: a token may be granted a few nanoseconds before it
-  is exactly due (see [`DESIGN.md`](DESIGN.md#units-exact-tokens-a-converted-clock)).
+- The only other rounding: a token may be granted a few nanoseconds before it is exactly due (or up to 2^-28 of a token early, for a bucket whose time to fill exceeds ~36 years) (see [`DESIGN.md`](DESIGN.md#units-exact-tokens-a-converted-clock)).
 
 ---
 
@@ -492,7 +496,9 @@ the common case.
 - [`BucketError::ZeroRefillAmount`](#bucketerror) — `refill_amount` was `0`.
 - [`BucketError::ZeroRefillPeriod`](#bucketerror) — `refill_period` was zero.
 
-Every configuration `new` accepts is represented exactly by the bucket. `new` is
+Every capacity `new` accepts is held exactly, and every rate refills on time;
+only rates above ~4.3 × 10^9 tokens/second round grants up to multi-token
+units. `new` is
 a `const fn` *(1.1)*, so a configuration can be validated at compile time.
 `BucketConfig` implements `Hash` *(1.1)*, and with the `serde` feature
 `Serialize` / `Deserialize` *(1.1)* — deserialization runs the same validation as
@@ -975,7 +981,7 @@ pub const fn config(&self) -> BucketConfig
 #[cfg(feature = "metrics")] pub fn metrics(&self) -> BucketMetrics
 ```
 
-The same lock-free engine as `Bucket`, without a clock. Every time-dependent
+The same engine as `Bucket` (lock-free on native 64-bit atomics), without a clock. Every time-dependent
 method takes `now`: the time elapsed since an epoch of your choosing (boot, a
 timer peripheral's zero, a test's start), the same epoch for every call on one
 bucket. The bucket holds its initial tokens as of the `now` passed to `new`, so

@@ -20,10 +20,11 @@ use crate::error::BucketError;
 /// `initial` is clamped to `capacity`: asking a bucket to start with more
 /// tokens than it can hold simply starts it full.
 ///
-/// Every value `new` accepts is represented exactly by the bucket: there is no
-/// capacity ceiling below `u32::MAX` and no rate too slow to refill, so
-/// [`Bucket::capacity`](crate::Bucket::capacity) always equals
-/// [`capacity`](Self::capacity).
+/// Every capacity `new` accepts is held exactly — there is no ceiling below
+/// `u32::MAX`, so [`Bucket::capacity`](crate::Bucket::capacity) always equals
+/// [`capacity`](Self::capacity) — and no rate is too slow to refill on time.
+/// Rates above ~4.3 × 10^9 tokens/second (which need a sub-second period) are
+/// the one approximation: they round each grant up to a multi-token unit.
 ///
 /// With the `serde` feature, `BucketConfig` implements `Serialize` and
 /// `Deserialize`. Deserialization runs the same validation as `new`, so a

@@ -33,7 +33,8 @@ Implements `Debug`, `Send`, and `Sync` (the latter two whenever `C` is).
 
 The caller-driven engine, available in every build including `no_std` (on
 targets with native 64-bit atomics, or anywhere with the `portable-atomic`
-feature). `new`, `acquire_at`, `try_acquire_at`, `acquire_up_to_at`,
+feature, which is lock-based and not interrupt-safe where the target has no
+native 64-bit atomics). `new`, `acquire_at`, `try_acquire_at`, `acquire_up_to_at`,
 `available_at`, `time_until_at`, `reserve_at`, `refund`, `reset_at`,
 `capacity`, `config`, and `metrics` (`metrics` feature). Implements `Debug`,
 `Send`, `Sync`.
@@ -112,14 +113,17 @@ These are promised and tested; they hold within the `1.x` line.
 
 - **Never over-grants.** Under any interleaving of concurrent callers, the
   tokens granted over any window never exceed the capacity plus the refill
-  accrued over that window — to within the bucket's resolution: a token may be
-  granted a few nanoseconds before it is exactly due — and the live token count stays within
-  `[0, capacity]`. A stale or backward clock reading can only cause a denial.
-  `reset` and `refund` add tokens deliberately and are outside this bound.
+  accrued over that window — to within the bucket's resolution: a token may be granted a few nanoseconds before it is exactly due (or up to 2^-28 of a token early, for a bucket whose time to fill exceeds ~36 years) — and the live token count stays within
+  `[0, capacity]`. A stale or backward clock reading, or one past the end of
+  the clock's range, can only cause a denial. `reset` and `refund` add tokens
+  deliberately and are outside this bound, and tokens taken by `reserve` count
+  at the end of their returned wait: the tokens reserved by any instant never
+  exceed the capacity plus the refill accrued by the time their waits end.
   Checked by `loom` with an advancing clock, a real-clock contention test, and
   `proptest`. (`1.0.0` stated this but did not hold it under real-clock
   contention; fixed in `1.1.0`.)
-- **Exact token accounting.** For rates below 10^9 tokens/second, grants,
+- **Exact token accounting.** For every rate up to ~4.3 × 10^9 tokens/second
+  (every `u32` amount per second), grants,
   refunds, and the capacity are exact: with no refill, every token is conserved.
 - **No panics.** No public operation panics on any input; the acquire path is
   infallible (returns a `Decision`, never a `Result`).
@@ -135,8 +139,9 @@ These are promised and tested; they hold within the `1.x` line.
 - **`reset`** refills to full as of now, discarding any reservation debt.
 - *(1.1)* **`capacity() == config().capacity()`**, always.
 - **Construction validation.** `BucketConfig::new` rejects zero capacity, zero
-  refill amount, and zero refill period with a `BucketError`. Every
-  configuration it accepts is represented exactly.
+  refill amount, and zero refill period with a `BucketError`. Every capacity
+  it accepts is held exactly and every rate refills on time; only rates above
+  ~4.3 × 10^9 tokens/second round grants up to multi-token units.
 
 ## Representation limits
 
@@ -147,9 +152,10 @@ Documented and stable for `1.x`:
 - `retry_after` and `time_until` are reported at **millisecond** resolution,
   rounded up.
 - Time is tracked in nanoseconds and never wraps *(1.1; `1.0` wrapped every
-  ~49.7 days)*. The bucket's clock saturates after at least ~438 years, after
-  which it stops refilling.
-- Rates of 10^9 tokens/second and above count tokens in multi-token units and
+  ~49.7 days)*. The bucket's clock saturates after at least ~438 years below
+  10^9 tokens/second (~100 years above), after which it is frozen: the bucket
+  grants at most what it still holds and then denies.
+- Rates above ~4.3 × 10^9 tokens/second count tokens in multi-token units and
   round each grant up to a whole unit.
 
 ## Explicitly NOT promised

@@ -21,7 +21,7 @@
 <div align="left">
     <p>
         <strong>better-bucket</strong> is a <b>lock-free token bucket</b> for Rust.
-        The hot path — <code>try_acquire</code> — is <b>lock-free</b>, <b>allocation-free</b>, and <b>cache-aligned</b>: a single atomic compare-and-swap on one word. No background timer thread, no per-tick wakeups: refill is computed <em>lazily</em> from a monotonic clock the instant you ask.
+        The hot path — <code>try_acquire</code> — is <b>lock-free</b> (on every target with native 64-bit atomics), <b>allocation-free</b>, and <b>cache-aligned</b>: a single atomic compare-and-swap on one word. No background timer thread, no per-tick wakeups: refill is computed <em>lazily</em> from a monotonic clock the instant you ask.
         It runs the same on <b>Linux</b>, <b>macOS</b>, and <b>Windows</b>, and its caller-driven core runs in <code>no_std</code>.
     </p>
     <p>
@@ -42,11 +42,11 @@
 
 <h2>What it does</h2>
 
-- **Lock-free acquire.** A single `compare_exchange_weak` on one atomic word. No `Mutex`, no `RwLock`, no parking on the hot path.
+- **Lock-free acquire.** A single `compare_exchange_weak` on one atomic word. No `Mutex`, no `RwLock`, no parking on the hot path. (On targets without native 64-bit atomics the optional `portable-atomic` path is lock-based; see Feature Flags.)
 - **Allocation-free.** No per-call operation allocates. A `Bucket<SystemClock>` is one 64-byte cache line with no heap tail.
 - **Lazy refill.** Tokens accrue from elapsed monotonic time, computed on access. No timer thread, no wakeups, nothing spent while idle.
-- **Never over-grants.** Stale readings, backward clocks, and races can only cause denials. Grants are exact token amounts; the only rounding is that a token may be granted a few nanoseconds before it is exactly due.
-- **No wrap, no clamp.** Nanosecond time that never wraps (at least ~438 years of range), capacity exact for every `u32`, slow rates (one per day, one per year) refill on time.
+- **Never over-grants.** Stale readings, backward clocks, races, and readings past the end of the clock's range can only cause denials. Grants are exact token amounts for every rate up to ~4.3 × 10^9 tokens/second (every `u32` amount per second); the only slack is that a token may be granted a few nanoseconds before it is exactly due (or up to 2^-28 of a token early, for a bucket whose time to fill exceeds ~36 years).
+- **No wrap, no clamp.** Nanosecond time that never wraps (at least ~438 years of range below 10^9 tokens/second, ~100 years above), capacity exact for every `u32`, slow rates (one per day, one per year) refill on time.
 - **Honest retry hints.** A denial carries the wait until the request would succeed; `time_until` gives the same answer without spending a token.
 - **`no_std` core.** `BucketCore` takes the time from the caller and needs only `core` and a 64-bit atomic (`portable-atomic` covers targets without one).
 - **One-line API.** The 80% case is a constructor and a method call.
@@ -55,7 +55,7 @@
 
 ## Features
 
-- **Token bucket core** — lock-free `try_acquire` / `acquire` (one `compare_exchange_weak` on one atomic word), allocation-free, cache-line aligned to avoid false sharing between independent buckets
+- **Token bucket core** — lock-free `try_acquire` / `acquire` on native 64-bit atomics (one `compare_exchange_weak` on one atomic word), allocation-free, cache-line aligned to avoid false sharing between independent buckets
 - **Lazy refill** — tokens accrue from monotonic elapsed time on access; no background threads, no timers
 - **Overflow-safe math** — checked / saturating / widened arithmetic everywhere; no input or idle gap can wrap the state
 - **Retry hints** — `Decision::Denied { retry_after }`, and the non-consuming `time_until(n)`
@@ -247,13 +247,17 @@ that can wrap into a phantom refill, and no skew window to tune.
 
 ### Exact tokens, no wrap
 
-Token amounts are counted in exact binary fractions of a token, so grants,
-refunds and the capacity never round (with the clock frozen, every token is
-conserved). The clock reading is converted to those units by one multiply and
+Token amounts are counted in exact binary fractions of a token, so for every
+rate up to ~4.3 × 10^9 tokens/second grants, refunds and the capacity never
+round (with the clock frozen, every token is conserved). Only faster buckets,
+which need a sub-second period, count in multi-token units and round each grant
+up to a whole unit. The clock reading is converted to those units by one multiply and
 one shift, rounded so an exactly-due token — five tokens 500 ms into a 10/s
 bucket — is granted on time. Time is nanoseconds since construction and never
-wraps; capacity is exact for every `u32`. The details, and every rounding
-direction, are in [`docs/DESIGN.md`](./docs/DESIGN.md).
+wraps; capacity is exact for every `u32`. Past the end of the clock's range
+(at least a century) the clock stops: the bucket hands out what it still holds
+and then denies. The details, and every rounding direction, are in
+[`docs/DESIGN.md`](./docs/DESIGN.md).
 
 ### How the no-over-grant contract is checked
 
@@ -307,15 +311,30 @@ cargo bench --features comparison           # + the governor comparison
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `std`   | ✅      | Standard library. Off → `no_std`: `BucketCore`, `BucketConfig`, `BucketBuilder::build_config`, `Decision`, `BucketError`. |
-| `clock` | ✅      | `Bucket`, `TokenBucket`, and the pluggable `clock-lib` time source (monotonic clock + mockable clock for tests). Implies `std` and `forge`. |
-| `forge` | ✅ (via `clock`) | `error_forge::ForgeError` for `BucketError`. |
-| `serde` | ❌      | `Serialize` / validating `Deserialize` for `BucketConfig`. |
-| `metrics` | ❌    | Allowed / denied / granted-token counters (`metrics()`). Zero cost when off. |
-| `portable-atomic` | ❌ | `portable-atomic` for the state word, for targets without native 64-bit atomics. |
+| `std`   | yes     | Standard library. Off → `no_std`: `BucketCore`, `BucketConfig`, `BucketBuilder::build_config`, `Decision`, `BucketError`. |
+| `clock` | yes     | `Bucket`, `TokenBucket`, and the pluggable `clock-lib` time source (monotonic clock + mockable clock for tests). Implies `std` and `forge`. |
+| `forge` | yes (via `clock`) | `error_forge::ForgeError` for `BucketError`. |
+| `serde` | no      | `Serialize` / validating `Deserialize` for `BucketConfig`. |
+| `metrics` | no    | Allowed / denied / granted-token counters (`metrics()`). Zero cost when off. |
+| `portable-atomic` | no | `portable-atomic` for the state word, for targets without native 64-bit atomics. |
 
 The `comparison` feature is benchmark-only — it pulls in `governor` for the
 head-to-head and is not part of the supported surface.
+
+> **`portable-atomic` is not lock-free.** On a target with native 64-bit atomics
+> it compiles to them and changes nothing. On a target without them (e.g.
+> `thumbv7em-none-eabihf`) portable-atomic's default fallback protects the state
+> word with a global spinlock (a seqlock): not lock-free, and **not safe to call
+> from an interrupt handler** — an interrupt that hits a bucket while thread code
+> holds the lock spins forever on a single-core MCU. Firmware that touches a
+> bucket from interrupt context must enable portable-atomic's
+> `unsafe-assume-single-core` feature (single-core, privileged code: atomics
+> by disabling interrupts) or its `critical-section` feature (with a
+> `critical-section` implementation) in the final binary:
+>
+> ```toml
+> portable-atomic = { version = "1", default-features = false, features = ["unsafe-assume-single-core"] }
+> ```
 
 <br>
 
@@ -371,9 +390,9 @@ pull in the rest of the family.
 ## Cross-Platform Support
 
 **Tier 1 Support:**
-- ✅ Linux (x86_64, aarch64)
-- ✅ macOS (Apple Silicon; x86_64 builds from the same code but is not in CI)
-- ✅ Windows (x86_64)
+- Linux (x86_64, aarch64)
+- macOS (Apple Silicon; x86_64 builds from the same code but is not in CI)
+- Windows (x86_64)
 
 Behavior is identical across all of them. CI runs Linux x86_64 and aarch64,
 macOS on Apple Silicon, and Windows x86_64 on stable and MSRV, plus a 32-bit

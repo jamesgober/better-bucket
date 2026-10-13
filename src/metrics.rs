@@ -17,9 +17,12 @@
 /// - `denied` — calls that granted nothing for a non-zero request. A steadily
 ///   climbing deny rate means the configured quota is below demand; a sudden
 ///   spike usually means a burst or a misbehaving client.
-/// - `tokens_granted` — total tokens handed out. Divided by elapsed time it is
-///   the bucket's achieved throughput, which should never exceed the configured
-///   rate by more than the capacity.
+/// - `tokens_granted` — total tokens handed out, including tokens taken ahead of
+///   their accrual by `reserve`. Divided by elapsed time it is the bucket's
+///   achieved throughput. Without `reset`, `refund`, or reservations whose wait
+///   is still running, it never exceeds the capacity plus the configured rate
+///   times the elapsed time; each of those deliberately moves tokens outside
+///   that bound.
 ///
 /// `reset` and `refund` are not counted: they move tokens, they are not
 /// decisions.

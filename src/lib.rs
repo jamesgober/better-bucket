@@ -1,8 +1,9 @@
 //! # better-bucket
 //!
 //! A lock-free token bucket for Rust. The hot path — `try_acquire` — is
-//! **lock-free**, **allocation-free**, and **cache-aligned**: a single
-//! compare-and-swap on one atomic word. Refill is **lazy**, computed from a
+//! **lock-free** (on every target with native 64-bit atomics),
+//! **allocation-free**, and **cache-aligned**: a single compare-and-swap on one
+//! atomic word. Refill is **lazy**, computed from a
 //! monotonic clock the instant you ask, so an idle bucket costs nothing — no
 //! background timer thread, no per-tick wakeups. The defining correctness
 //! property is that the bucket **never over-grants**: under any interleaving of
@@ -20,10 +21,13 @@
 //! `[0, capacity]`**, under any concurrent interleaving, adversarial input, and
 //! extreme uptime. The state is a single instant — when the bucket would have
 //! been empty — so a stale or backward clock reading can only make a decision
-//! more conservative; it can never manufacture a refill. Capacity is exact for
-//! every `u32`, time is tracked in nanoseconds and never wraps (~438 years of
-//! range), and token amounts are exact; the only slack is that a token may be
-//! granted a few nanoseconds before it is exactly due.
+//! more conservative; it can never manufacture a refill, and a reading past the
+//! end of the clock's range fails closed. Capacity is exact for every `u32`,
+//! time is tracked in nanoseconds and never wraps (at least ~438 years of range
+//! below 10^9 tokens/second, ~100 years above), and token amounts are exact for
+//! every rate up to ~4.3 × 10^9 tokens/second; the only slack is that a token
+//! may be granted a few nanoseconds before it is exactly due (or up to 2^-28 of
+//! a token early, for a bucket whose time to fill exceeds ~36 years).
 //!
 //! This is checked by `loom` model checking on the real bucket with an
 //! advancing clock, a real-clock multi-thread grant-ceiling test, property
@@ -73,7 +77,7 @@
 //! ## Design goals
 //!
 //! - **Lock-free acquire.** One `compare_exchange_weak` on one atomic word; no
-//!   `Mutex`, no parking on the hot path.
+//!   `Mutex`, no parking on the hot path (on native 64-bit atomics).
 //! - **Allocation-free steady state.** A `Bucket<SystemClock>` is one 64-byte
 //!   cache line with no heap tail; acquiring never allocates.
 //! - **Lazy refill.** Tokens accrue from elapsed monotonic time on access — no
@@ -93,7 +97,7 @@
 //! | `forge` | yes (via `clock`) | `error_forge::ForgeError` for [`BucketError`]. |
 //! | `serde` | no      | `Serialize` / validating `Deserialize` for [`BucketConfig`]. |
 //! | `metrics` | no    | Allowed / denied / granted-token counters on every bucket. Zero cost when off. |
-//! | `portable-atomic` | no | Use [`portable-atomic`](https://crates.io/crates/portable-atomic) for the state word, for targets without native 64-bit atomics (e.g. Cortex-M). |
+//! | `portable-atomic` | no | Use [`portable-atomic`](https://crates.io/crates/portable-atomic) for the state word, for targets without native 64-bit atomics (e.g. Cortex-M). There it is a global lock: not lock-free, and not interrupt-safe unless the binary enables portable-atomic's `unsafe-assume-single-core` or `critical-section` feature. |
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
