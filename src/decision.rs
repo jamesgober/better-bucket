@@ -4,7 +4,8 @@ use core::time::Duration;
 
 /// The result of attempting to take tokens from a bucket.
 ///
-/// Returned by [`Bucket::acquire`](crate::Bucket::acquire). The acquire path is
+/// Returned by [`Bucket::acquire`](crate::Bucket::acquire) and
+/// [`BucketCore::acquire_at`](crate::BucketCore::acquire_at). The acquire path is
 /// infallible — there is no error case, only an allow/deny outcome — so this is
 /// a plain enum rather than a `Result`. When the request is denied, the
 /// decision carries how long the caller should wait before enough tokens will
@@ -18,6 +19,7 @@ use core::time::Duration;
 /// # Examples
 ///
 /// ```
+/// # #[cfg(feature = "clock")] {
 /// use better_bucket::{Bucket, Decision};
 ///
 /// let bucket = Bucket::per_second(1);
@@ -29,6 +31,7 @@ use core::time::Duration;
 ///     }
 ///     _ => {}
 /// }
+/// # }
 /// ```
 #[must_use]
 #[non_exhaustive]
@@ -38,9 +41,12 @@ pub enum Decision {
     Allowed,
     /// The request was refused because the bucket did not hold enough tokens.
     Denied {
-        /// The minimum wait until the bucket will hold enough tokens to grant
-        /// the same request. [`Duration::MAX`] means the request can never
-        /// succeed (it asked for more tokens than the bucket's capacity).
+        /// How long until the bucket will hold enough tokens to grant the same
+        /// request, rounded up to the millisecond, so waiting this long is
+        /// always enough. [`Duration::MAX`] means the request can never
+        /// succeed: it asked for more tokens than the bucket's capacity, or the
+        /// refill is so slow the wait would outlast the bucket's clock range
+        /// (centuries).
         retry_after: Duration,
     },
 }

@@ -95,12 +95,7 @@ impl BucketConfig {
         if refill_period.is_zero() {
             return Err(BucketError::ZeroRefillPeriod);
         }
-        Ok(Self {
-            capacity,
-            refill_amount,
-            refill_period,
-            initial: initial.min(capacity),
-        })
+        Ok(Self::raw(capacity, refill_amount, refill_period, initial))
     }
 
     /// The maximum number of tokens the bucket holds (its burst ceiling).
@@ -131,17 +126,22 @@ impl BucketConfig {
     /// constructors. A degenerate request (zero capacity or zero refill) yields
     /// a bucket that grants nothing, which is well-defined and safe rather than
     /// a panic.
-    pub(crate) fn raw(
+    pub(crate) const fn raw(
         capacity: u32,
         refill_amount: u32,
         refill_period: Duration,
         initial: u32,
     ) -> Self {
+        let initial = if initial < capacity {
+            initial
+        } else {
+            capacity
+        };
         Self {
             capacity,
             refill_amount,
             refill_period,
-            initial: initial.min(capacity),
+            initial,
         }
     }
 }

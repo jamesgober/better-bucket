@@ -80,17 +80,19 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 # Default build: std on, monotonic system clock available.
 default = ["std", "clock"]
 
-# Standard library. With it off, the crate is `no_std`. The lock-free accounting
-# core needs only `core` atomics, but the `Bucket` surface reads the clock, so a
-# bare `no_std` build exposes only `VERSION`. Propagates std to clock-lib when
-# the `clock` feature is on.
+# Standard library. With it off, the crate is `no_std`: `BucketCore` (the
+# caller-driven engine), `BucketConfig`, `BucketBuilder::build_config`,
+# `Decision`, and `BucketError` remain, needing only `core` and a 64-bit atomic.
+# Propagates std to clock-lib when the `clock` feature is on.
 std = ["clock-lib?/std"]
 
 # Pluggable clock source (clock-lib): monotonic time + a mockable clock for
-# deterministic, sleep-free tests. On by default.
+# deterministic, sleep-free tests. On by default. Gates `Bucket<C>`, the
+# `TokenBucket` trait, and `BucketBuilder`.
 #
 # `clock` implies `std` because clock-lib's `Clock` trait (and `ManualClock`)
-# are themselves std-gated. It gates the entire `Bucket` surface.
+# are themselves std-gated. It also brings the `error_forge::ForgeError` impl
+# for `BucketError`.
 clock = ["std", "dep:clock-lib", "dep:error-forge"]
 
 # Benchmark-only: pulls in `governor` for the comparative benchmark
@@ -108,9 +110,9 @@ comparison = ["clock", "dep:governor"]
 # (e.g. rate-net) and tests can substitute a ManualClock.
 clock-lib = { version = "1.0", optional = true, default-features = false }
 
-# Domain error type (config validation) via the portfolio error stack, instead
-# of thiserror/anyhow in a library crate. Only the `ForgeError` trait is used;
-# `BucketError` is hand-written so every variant is documented.
+# Domain error type metadata (kind/caption) via the portfolio error stack,
+# instead of thiserror/anyhow in a library crate. Only the `ForgeError` trait is
+# used; `BucketError` is hand-written so every variant is documented.
 error-forge = { version = "1.0", optional = true }
 
 # Benchmark-only incumbent, behind the `comparison` feature. Used solely by the
@@ -153,7 +155,11 @@ required-features = ["comparison"]
 
 # EXAMPLES
 # #################################
-# All examples drive a `Bucket` and so require the clock feature.
+# `caller_driven` uses only `BucketCore`, so it builds in every configuration;
+# the rest drive a `Bucket` and so require the clock feature.
+[[example]]
+name = "caller_driven"
+
 [[example]]
 name              = "per_second"
 required-features = ["clock"]

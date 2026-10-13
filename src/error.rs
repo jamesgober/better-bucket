@@ -6,12 +6,15 @@
 //! working bucket is rejected up front rather than producing a bucket that
 //! misbehaves later.
 //!
-//! [`BucketError`] implements [`error_forge::ForgeError`], so it slots into the
-//! portfolio error stack (kinds, captions, the central error hook) the same way
-//! every other domain error does.
+//! [`BucketError`] implements [`core::error::Error`] (the same trait as
+//! `std::error::Error`) in every build, including `no_std`. With the `clock`
+//! feature (on by default) it also implements `error_forge::ForgeError`, so it
+//! slots into the portfolio error stack (kinds, captions, the central error
+//! hook) the same way every other domain error does.
 
 use core::fmt;
 
+#[cfg(feature = "clock")]
 use error_forge::ForgeError;
 
 /// A configuration rejected at construction time.
@@ -59,8 +62,10 @@ impl fmt::Display for BucketError {
     }
 }
 
-impl std::error::Error for BucketError {}
+impl core::error::Error for BucketError {}
 
+#[cfg(feature = "clock")]
+#[cfg_attr(docsrs, doc(cfg(feature = "clock")))]
 impl ForgeError for BucketError {
     fn kind(&self) -> &'static str {
         match self {
@@ -80,7 +85,9 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::BucketError;
+    #[cfg(feature = "clock")]
     use error_forge::ForgeError;
+    use std::string::ToString;
 
     #[test]
     fn test_display_names_the_violated_constraint() {
@@ -90,12 +97,29 @@ mod tests {
     }
 
     #[test]
+    fn test_implements_core_error() {
+        fn assert_error<E: core::error::Error + Send + Sync + 'static>() {}
+        assert_error::<BucketError>();
+    }
+
+    #[cfg(feature = "clock")]
+    #[test]
     fn test_forge_kind_matches_variant() {
         assert_eq!(BucketError::ZeroCapacity.kind(), "ZeroCapacity");
         assert_eq!(BucketError::ZeroRefillAmount.kind(), "ZeroRefillAmount");
         assert_eq!(BucketError::ZeroRefillPeriod.kind(), "ZeroRefillPeriod");
     }
 
+    #[cfg(feature = "clock")]
+    #[test]
+    fn test_forge_caption_names_the_domain() {
+        assert_eq!(
+            BucketError::ZeroRefillPeriod.caption(),
+            "Invalid bucket configuration"
+        );
+    }
+
+    #[cfg(feature = "clock")]
     #[test]
     fn test_config_errors_are_not_retryable() {
         // A bad configuration will not fix itself on retry.
