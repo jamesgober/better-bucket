@@ -135,6 +135,38 @@ jobs:
         env:
           PROPTEST_CASES: "8"
           MIRIFLAGS: "-Zmiri-disable-isolation"
+      - name: Miri (portable-atomic path)
+        run: cargo miri test --lib --features portable-atomic,metrics -- --skip test_high_contention_conserves_every_token --skip test_core_concurrent_mixed_operations_conserve_tokens
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation"
+
+  asan:
+    name: AddressSanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      # `--target` keeps the sanitizer flags off build scripts and proc macros;
+      # `-Zbuild-std` instruments the standard library too. Doctests are not
+      # instrumented, so only the unit and integration tests run.
+      - name: ASan
+        run: >-
+          cargo test -Zbuild-std --target x86_64-unknown-linux-gnu
+          --features serde,metrics --lib --tests
+        env:
+          RUSTFLAGS: "-Zsanitizer=address"
+          RUSTDOCFLAGS: "-Zsanitizer=address"
+          ASAN_OPTIONS: "detect_leaks=1"
+
+  semver:
+    name: SemVer (cargo-semver-checks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
 
   security:
     name: Security (audit + deny)
