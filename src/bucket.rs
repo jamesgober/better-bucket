@@ -57,7 +57,8 @@ const fn tier1_config(capacity: u32, amount: u32, period: Duration, initial: u32
 /// accrues over that window. The only slack is the bucket's resolution: a token
 /// may be granted a few nanoseconds before it is exactly due. A stale or
 /// non-monotonic clock reading can only cause a denial, never an extra grant.
-/// [`reset`](Self::reset) deliberately adds tokens and is outside that bound.
+/// [`reset`](Self::reset) and [`refund`](Self::refund) deliberately add tokens
+/// and are outside that bound.
 ///
 /// # Limits
 ///
@@ -67,7 +68,8 @@ const fn tier1_config(capacity: u32, amount: u32, period: Duration, initial: u32
 /// from empty exceeds ~36.5 years tracks time in coarser ticks, which only
 /// matters at that scale. `retry_after` and [`time_until`](Self::time_until)
 /// are rounded up to the millisecond. A plain token bucket has no queue, so a
-/// large request can be starved by a stream of small ones.
+/// large request can be starved by a stream of small ones; use
+/// [`reserve`](Self::reserve) where that matters.
 ///
 /// A `Bucket<SystemClock>` is exactly one 64-byte cache line, so independent
 /// buckets never falsely share.
@@ -327,6 +329,44 @@ impl<C: Clock> Bucket<C> {
         self.acquire_at(n, now).is_allowed()
     }
 
+    /// Takes as many of `n` tokens as are available right now (possibly zero)
+    /// and returns how many it took.
+    ///
+    /// The partial-grant form, for byte-oriented throttling: write what the
+    /// budget allows now, the rest later. Never takes more than the capacity.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::Bucket;
+    ///
+    /// let bucket = Bucket::per_second(1_000);
+    /// assert_eq!(bucket.acquire_up_to(600), 600);
+    /// assert!(bucket.acquire_up_to(600) <= 401); // only what is left
+    /// ```
+    #[must_use = "the returned count is how many tokens were actually taken"]
+    pub fn acquire_up_to(&self, n: u32) -> u32 {
+        self.core.acquire_up_to(n, self.elapsed())
+    }
+
+    /// [`acquire_up_to`](Self::acquire_up_to) at a caller-supplied clock
+    /// reading; see [`acquire_at`](Self::acquire_at).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::Bucket;
+    /// use clock_lib::{Clock, SystemClock};
+    ///
+    /// let bucket = Bucket::per_second(10);
+    /// let now = SystemClock::new().now();
+    /// assert_eq!(bucket.acquire_up_to_at(25, now), 10);
+    /// ```
+    #[must_use = "the returned count is how many tokens were actually taken"]
+    pub fn acquire_up_to_at(&self, n: u32, now: Monotonic) -> u32 {
+        self.core.acquire_up_to(n, self.elapsed_at(now))
+    }
+
     /// Returns how many whole tokens are available right now, after lazy refill.
     ///
     /// This is a momentary snapshot; under concurrent acquires it can be stale
@@ -419,6 +459,80 @@ impl<C: Clock> Bucket<C> {
         self.core.time_until(n, self.elapsed_at(now))
     }
 
+    /// Reserves `n` tokens now, even if they have not accrued yet, as long as
+    /// the wait until they are covered is at most `max_wait`.
+    ///
+    /// On success the tokens are taken immediately and the returned duration is
+    /// how long to wait before acting on them (zero if they were already
+    /// there). Later callers queue behind the reservation, so a large request
+    /// cannot be starved by a stream of small ones. Returns `None`, reserving
+    /// nothing, if `n` exceeds the capacity or the wait would exceed
+    /// `max_wait`. The bucket never sleeps on your behalf; pass the wait to
+    /// `std::thread::sleep` or an async timer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::Bucket;
+    /// use clock_lib::ManualClock;
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// let clock = Arc::new(ManualClock::new());
+    /// let bucket = Bucket::per_second(10).with_clock(Arc::clone(&clock));
+    /// assert!(bucket.try_acquire(10)); // empty
+    ///
+    /// let wait = bucket.reserve(5, Duration::from_secs(1));
+    /// assert_eq!(wait, Some(Duration::from_millis(500)));
+    /// // Too long a wait: nothing reserved.
+    /// assert_eq!(bucket.reserve(10, Duration::from_secs(1)), None);
+    /// ```
+    #[must_use = "the returned wait must be honoured before using the tokens"]
+    pub fn reserve(&self, n: u32, max_wait: Duration) -> Option<Duration> {
+        self.core.reserve(n, max_wait, self.elapsed())
+    }
+
+    /// [`reserve`](Self::reserve) at a caller-supplied clock reading; see
+    /// [`acquire_at`](Self::acquire_at).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::Bucket;
+    /// use clock_lib::{Clock, SystemClock};
+    /// use std::time::Duration;
+    ///
+    /// let bucket = Bucket::per_second(3);
+    /// let now = SystemClock::new().now();
+    /// assert_eq!(bucket.reserve_at(3, Duration::ZERO, now), Some(Duration::ZERO));
+    /// ```
+    #[must_use = "the returned wait must be honoured before using the tokens"]
+    pub fn reserve_at(&self, n: u32, max_wait: Duration, now: Monotonic) -> Option<Duration> {
+        self.core.reserve(n, max_wait, self.elapsed_at(now))
+    }
+
+    /// Returns `n` previously acquired tokens to the bucket.
+    ///
+    /// For work that acquired tokens and was then cancelled or failed before it
+    /// used the budget. The balance never exceeds the capacity, and a refund
+    /// also pays down an outstanding [`reserve`](Self::reserve). Refunding
+    /// tokens that were never acquired lets the bucket grant beyond its rate;
+    /// only refund what you took.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::Bucket;
+    ///
+    /// let bucket = Bucket::per_second(10);
+    /// assert!(bucket.try_acquire(10));
+    /// bucket.refund(4); // the request for 4 of them failed upstream
+    /// assert!(bucket.available() >= 4);
+    /// ```
+    pub fn refund(&self, n: u32) {
+        self.core.refund(n);
+    }
+
     /// Returns the bucket's capacity (its burst ceiling), in whole tokens.
     ///
     /// Always equal to `self.config().capacity()`.
@@ -474,7 +588,8 @@ impl<C: Clock> Bucket<C> {
 
     /// Refills the bucket to full and marks it current as of now.
     ///
-    /// Use it to discard accumulated debt and grant a fresh burst — for example at the start of a new billing
+    /// Use it to discard accumulated debt (including outstanding reservations)
+    /// and grant a fresh burst — for example at the start of a new billing
     /// window, or to clear a backlog after a dependency recovers. Long uptime
     /// needs no special handling: the clock never wraps.
     ///
@@ -908,6 +1023,30 @@ mod tests {
     }
 
     #[test]
+    fn test_at_methods_use_the_supplied_reading() {
+        let (clock, bucket) = manual_bucket(10);
+        let start = clock.now();
+        assert!(bucket.try_acquire_at(10, start));
+        clock.advance(Duration::from_millis(500));
+        let later = clock.now();
+        assert_eq!(bucket.available_at(start), 0);
+        assert_eq!(bucket.available_at(later), 5);
+        assert_eq!(
+            bucket.time_until_at(5, start),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(bucket.time_until_at(5, later), Some(Duration::ZERO));
+        assert_eq!(bucket.acquire_at(5, later), Decision::Allowed);
+        assert_eq!(bucket.acquire_up_to_at(5, later), 0);
+        assert_eq!(
+            bucket.reserve_at(1, Duration::from_secs(1), later),
+            Some(Duration::from_millis(100))
+        );
+        bucket.reset_at(later);
+        assert_eq!(bucket.available_at(later), 10);
+    }
+
+    #[test]
     fn test_reading_before_construction_is_clamped() {
         let clock = Arc::new(ManualClock::new());
         let before = clock.now();
@@ -926,6 +1065,35 @@ mod tests {
         assert_eq!(bucket.time_until(0), Some(Duration::ZERO));
         assert_eq!(bucket.time_until(11), None);
         assert_eq!(bucket.available(), 0);
+    }
+
+    #[test]
+    fn test_reserve_queues_large_requests_fairly() {
+        let (clock, bucket) = manual_bucket(10);
+        assert!(bucket.try_acquire(10));
+        // A full-capacity request reserves its place; small requests that come
+        // after it wait behind it instead of starving it.
+        assert_eq!(
+            bucket.reserve(10, Duration::from_secs(5)),
+            Some(Duration::from_secs(1))
+        );
+        clock.advance(Duration::from_millis(500));
+        assert!(!bucket.try_acquire(1));
+        clock.advance(Duration::from_millis(600));
+        assert!(bucket.try_acquire(1));
+        assert_eq!(bucket.reserve(10, Duration::from_millis(100)), None);
+    }
+
+    #[test]
+    fn test_acquire_up_to_and_refund() {
+        let (_clock, bucket) = manual_bucket(10);
+        assert_eq!(bucket.acquire_up_to(4), 4);
+        assert_eq!(bucket.acquire_up_to(100), 6);
+        assert_eq!(bucket.acquire_up_to(1), 0);
+        bucket.refund(7);
+        assert_eq!(bucket.available(), 7);
+        bucket.refund(100);
+        assert_eq!(bucket.available(), 10);
     }
 
     #[test]

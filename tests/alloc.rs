@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use better_bucket::Bucket;
-use clock_lib::ManualClock;
+use clock_lib::{Clock, ManualClock};
 
 thread_local! {
     // `const` init uses native thread-local storage, so reading or incrementing
@@ -73,6 +73,20 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
+/// Every other per-call operation, so the audit covers the whole surface.
+fn exercise(bucket: &Bucket<Arc<ManualClock>>) {
+    let now = bucket.clock().now();
+    let _ = bucket.acquire(1);
+    let _ = bucket.acquire_at(1, now);
+    let _ = bucket.available();
+    let _ = bucket.available_at(now);
+    let _ = bucket.time_until(2);
+    let _ = bucket.acquire_up_to(2);
+    let _ = bucket.reserve(1, Duration::from_millis(5));
+    bucket.refund(1);
+    let _ = bucket.acquire(u32::MAX); // the never-grantable path
+}
+
 #[test]
 fn test_acquire_path_does_not_allocate() {
     let clock = Arc::new(ManualClock::new());
@@ -85,8 +99,7 @@ fn test_acquire_path_does_not_allocate() {
         if bucket.try_acquire(1) {
             warm += 1;
         }
-        let _ = bucket.acquire(1);
-        let _ = bucket.available();
+        exercise(&bucket);
         clock.advance(Duration::from_millis(1));
     }
     assert!(warm > 0);
@@ -98,8 +111,7 @@ fn test_acquire_path_does_not_allocate() {
         if bucket.try_acquire(1) {
             granted += 1;
         }
-        let _ = bucket.acquire(1);
-        let _ = bucket.available();
+        exercise(&bucket);
         clock.advance(Duration::from_millis(1));
     }
     let allocations = alloc_count() - before;
