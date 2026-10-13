@@ -7,14 +7,15 @@
 //! misbehaves later.
 //!
 //! [`BucketError`] implements [`core::error::Error`] (the same trait as
-//! `std::error::Error`) in every build, including `no_std`. With the `clock`
-//! feature (on by default) it also implements `error_forge::ForgeError`, so it
-//! slots into the portfolio error stack (kinds, captions, the central error
-//! hook) the same way every other domain error does.
+//! `std::error::Error`) in every build, including `no_std`. With the `forge`
+//! feature (implied by `clock`, so on by default) it also implements
+//! `error_forge::ForgeError`, so it slots into the portfolio error stack (kinds,
+//! captions, the central error hook) the same way every other domain error
+//! does.
 
 use core::fmt;
 
-#[cfg(feature = "clock")]
+#[cfg(feature = "forge")]
 use error_forge::ForgeError;
 
 /// A configuration rejected at construction time.
@@ -64,8 +65,8 @@ impl fmt::Display for BucketError {
 
 impl core::error::Error for BucketError {}
 
-#[cfg(feature = "clock")]
-#[cfg_attr(docsrs, doc(cfg(feature = "clock")))]
+#[cfg(feature = "forge")]
+#[cfg_attr(docsrs, doc(cfg(feature = "forge")))]
 impl ForgeError for BucketError {
     fn kind(&self) -> &'static str {
         match self {
@@ -85,7 +86,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::BucketError;
-    #[cfg(feature = "clock")]
+    #[cfg(feature = "forge")]
     use error_forge::ForgeError;
     use std::string::ToString;
 
@@ -102,7 +103,7 @@ mod tests {
         assert_error::<BucketError>();
     }
 
-    #[cfg(feature = "clock")]
+    #[cfg(feature = "forge")]
     #[test]
     fn test_forge_kind_matches_variant() {
         assert_eq!(BucketError::ZeroCapacity.kind(), "ZeroCapacity");
@@ -110,7 +111,7 @@ mod tests {
         assert_eq!(BucketError::ZeroRefillPeriod.kind(), "ZeroRefillPeriod");
     }
 
-    #[cfg(feature = "clock")]
+    #[cfg(feature = "forge")]
     #[test]
     fn test_forge_caption_names_the_domain() {
         assert_eq!(
@@ -119,7 +120,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "clock")]
+    #[cfg(feature = "forge")]
     #[test]
     fn test_config_errors_are_not_retryable() {
         // A bad configuration will not fix itself on retry.
