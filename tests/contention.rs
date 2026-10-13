@@ -140,7 +140,7 @@ fn test_stale_reading_after_a_later_commit_grants_nothing_extra() {
         armed: AtomicBool::new(true),
     };
     let config = BucketConfig::new(10, 10, Duration::from_secs(1), 10).unwrap();
-    let bucket = Arc::new(Bucket::from_config(config).with_clock(clock));
+    let bucket = Arc::new(Bucket::with_config_and_clock(config, clock));
 
     let shared = Arc::clone(&bucket);
     let victim = thread::Builder::new()
@@ -195,7 +195,7 @@ fn test_backward_clock_step_never_refills() {
         wall: manual.wall(),
     });
     let config = BucketConfig::new(100, 100, Duration::from_secs(1), 100).unwrap();
-    let bucket = Bucket::from_config(config).with_clock(Arc::clone(&clock));
+    let bucket = Bucket::with_config_and_clock(config, Arc::clone(&clock));
 
     *clock.now.lock().unwrap() = t5;
     assert!(bucket.try_acquire(100)); // drain at t = 5 s
@@ -204,6 +204,7 @@ fn test_backward_clock_step_never_refills() {
     *clock.now.lock().unwrap() = t0; // the clock steps back 5 s
     assert_eq!(bucket.available(), 0, "a backward step refilled the bucket");
     assert!(!bucket.try_acquire(1));
+    assert_eq!(bucket.time_until(1), Some(Duration::from_millis(5_010)));
 
     // Once time is back past the last commit, refill resumes normally.
     *clock.now.lock().unwrap() = t5;
@@ -214,10 +215,29 @@ fn test_backward_clock_step_never_refills() {
 }
 
 #[test]
+fn test_reading_before_construction_counts_as_construction() {
+    let early = SettableClock {
+        now: Mutex::new(Monotonic::now()),
+        wall: Wall::now(),
+    };
+    let before = early.now();
+    thread::sleep(Duration::from_millis(2));
+    *early.now.lock().unwrap() = Monotonic::now();
+    let bucket = Bucket::with_config_and_clock(
+        BucketConfig::new(5, 5, Duration::from_secs(1), 2).unwrap(),
+        early,
+    );
+    // `before` predates the bucket: no refill, no panic, the initial 2 tokens.
+    assert_eq!(bucket.available_at(before), 2);
+    assert!(bucket.try_acquire_at(2, before));
+    assert!(!bucket.try_acquire_at(1, before));
+}
+
+#[test]
 fn test_concurrent_denials_at_a_frozen_instant_report_one_honest_wait() {
     let clock = Arc::new(ManualClock::new());
     let config = BucketConfig::new(8, 8, Duration::from_secs(1), 8).unwrap();
-    let bucket = Arc::new(Bucket::from_config(config).with_clock(Arc::clone(&clock)));
+    let bucket = Arc::new(Bucket::with_config_and_clock(config, Arc::clone(&clock)));
     assert!(bucket.try_acquire(8));
 
     let handles: Vec<_> = (0..8)
