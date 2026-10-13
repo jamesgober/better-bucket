@@ -99,6 +99,11 @@ clock = ["std", "dep:clock-lib", "dep:error-forge"]
 # the same validation as `BucketConfig::new`. Off by default; no_std-compatible.
 serde = ["dep:serde"]
 
+# Relaxed allowed / denied / granted-token counters on every bucket, read with
+# `metrics()`. Off by default; with it off the counters do not exist (no field,
+# no atomic increment).
+metrics = []
+
 # Benchmark-only: pulls in `governor` for the comparative benchmark
 # (`cargo bench --features comparison --bench comparison`). Never enabled in a
 # normal build, so it does not affect the crate's dependency footprint or MSRV.

@@ -19,6 +19,8 @@ use clock_lib::{Clock, Monotonic, SystemClock};
 use crate::config::BucketConfig;
 use crate::decision::Decision;
 use crate::engine::Core;
+#[cfg(feature = "metrics")]
+use crate::metrics::BucketMetrics;
 
 /// Maps a Tier-1 request to a config, collapsing a degenerate request (zero
 /// capacity, amount, or period) to a bucket that grants nothing. That is
@@ -71,8 +73,8 @@ const fn tier1_config(capacity: u32, amount: u32, period: Duration, initial: u32
 /// large request can be starved by a stream of small ones; use
 /// [`reserve`](Self::reserve) where that matters.
 ///
-/// A `Bucket<SystemClock>` is exactly one 64-byte cache line, so independent
-/// buckets never falsely share.
+/// A `Bucket<SystemClock>` is exactly one 64-byte cache line (without the
+/// `metrics` feature), so independent buckets never falsely share.
 ///
 /// # Examples
 ///
@@ -627,6 +629,26 @@ impl<C: Clock> Bucket<C> {
         self.core.reset(self.elapsed_at(now));
     }
 
+    /// Returns a snapshot of the bucket's decision counters.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::Bucket;
+    ///
+    /// let bucket = Bucket::per_second(1);
+    /// let _ = bucket.try_acquire(1);
+    /// let _ = bucket.try_acquire(1);
+    /// let metrics = bucket.metrics();
+    /// assert_eq!(metrics.allowed + metrics.denied, 2);
+    /// ```
+    #[cfg(feature = "metrics")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
+    #[must_use]
+    pub fn metrics(&self) -> BucketMetrics {
+        self.core.metrics()
+    }
+
     /// Elapsed time since construction, from the bucket's own clock.
     #[inline]
     fn elapsed(&self) -> Duration {
@@ -998,7 +1020,7 @@ mod tests {
     #[test]
     fn test_system_clock_bucket_is_one_cache_line() {
         assert_eq!(core::mem::align_of::<Bucket<SystemClock>>(), 64);
-        #[cfg(target_pointer_width = "64")]
+        #[cfg(all(not(feature = "metrics"), target_pointer_width = "64"))]
         assert_eq!(core::mem::size_of::<Bucket<SystemClock>>(), 64);
     }
 
@@ -1126,5 +1148,18 @@ mod tests {
         assert_eq!(as_trait.time_until(1), Some(Duration::from_millis(500)));
         as_trait.reset();
         assert_eq!(as_trait.available(), 2);
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn test_bucket_metrics_count_decisions() {
+        let (_clock, bucket) = manual_bucket(2);
+        assert!(bucket.try_acquire(2));
+        assert!(!bucket.try_acquire(1));
+        let metrics = bucket.metrics();
+        assert_eq!(
+            (metrics.allowed, metrics.denied, metrics.tokens_granted),
+            (1, 1, 2)
+        );
     }
 }

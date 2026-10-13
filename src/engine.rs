@@ -56,6 +56,8 @@ use loom::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::BucketConfig;
 use crate::decision::Decision;
+#[cfg(feature = "metrics")]
+use crate::metrics::BucketMetrics;
 
 /// Offset added to every instant, in units. Larger than any burst, so
 /// `now − burst` and the initial `now − cost(initial)` never underflow.
@@ -143,8 +145,16 @@ impl Scale {
     }
 }
 
+/// Allowed / denied / granted-token counters, behind the `metrics` feature.
+#[cfg(feature = "metrics")]
+struct Counters {
+    allowed: AtomicU64,
+    denied: AtomicU64,
+    tokens_granted: AtomicU64,
+}
+
 /// The shared engine: the packed state plus the immutable rate and the
-/// configuration it was built from. 48 bytes.
+/// configuration it was built from. 48 bytes without `metrics`.
 pub(crate) struct Core {
     /// The empty-instant `z`, in units offset by [`ORIGIN`]. The only mutable
     /// accounting state and the single point of synchronisation.
@@ -159,6 +169,8 @@ pub(crate) struct Core {
     period_nanos: u32,
     /// See [`Scale::unit_shift`].
     unit_shift: i8,
+    #[cfg(feature = "metrics")]
+    counters: Counters,
 }
 
 impl Core {
@@ -179,6 +191,12 @@ impl Core {
             initial: config.initial(),
             period_nanos: period.subsec_nanos(),
             unit_shift: rate.unit_shift,
+            #[cfg(feature = "metrics")]
+            counters: Counters {
+                allowed: AtomicU64::new(0),
+                denied: AtomicU64::new(0),
+                tokens_granted: AtomicU64::new(0),
+            },
         };
         let initial = core.cost(config.initial().min(config.capacity()));
         core.state
@@ -276,10 +294,12 @@ impl Core {
     pub(crate) fn acquire(&self, n: u32, now: Duration) -> Decision {
         if n == 0 {
             // Zero tokens are always available, even from an empty bucket.
+            self.record_allowed(0);
             return Decision::Allowed;
         }
         if n > self.capacity {
             // More than the bucket can ever hold: it can never be granted.
+            self.record_denied();
             return Decision::Denied {
                 retry_after: Duration::MAX,
             };
@@ -294,6 +314,7 @@ impl Core {
             if next > now_u {
                 // Denied: report the wait for the shortfall to accrue. No write,
                 // so a denied request never contends with a granting one.
+                self.record_denied();
                 return Decision::Denied {
                     retry_after: self.wait_until(next, now).unwrap_or(Duration::MAX),
                 };
@@ -309,6 +330,7 @@ impl Core {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
+                    self.record_allowed(n);
                     return Decision::Allowed;
                 }
                 // Lost the race (or a spurious weak failure): retry against the
@@ -324,6 +346,7 @@ impl Core {
     /// Grants as many of `n` tokens as are available, returning the count.
     pub(crate) fn acquire_up_to(&self, n: u32, now: Duration) -> u32 {
         if n == 0 {
+            self.record_allowed(0);
             return 0;
         }
         let want = n.min(self.capacity);
@@ -341,6 +364,7 @@ impl Core {
             }
             .min(want);
             if take == 0 {
+                self.record_denied();
                 return 0;
             }
             // cost(take) <= credit by construction of `tokens_for`.
@@ -352,6 +376,7 @@ impl Core {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
+                    self.record_allowed(take);
                     return take;
                 }
                 Err(actual) => {
@@ -406,9 +431,11 @@ impl Core {
     /// they are covered is at most `max_wait`. Returns that wait.
     pub(crate) fn reserve(&self, n: u32, max_wait: Duration, now: Duration) -> Option<Duration> {
         if n == 0 {
+            self.record_allowed(0);
             return Some(Duration::ZERO);
         }
         if n > self.capacity {
+            self.record_denied();
             return None;
         }
         let now_u = self.units(now);
@@ -422,7 +449,10 @@ impl Core {
             } else {
                 self.wait_until(next, now)
             };
-            let wait = wait.filter(|wait| *wait <= max_wait)?;
+            let Some(wait) = wait.filter(|wait| *wait <= max_wait) else {
+                self.record_denied();
+                return None;
+            };
             match self.state.compare_exchange_weak(
                 current,
                 next,
@@ -430,6 +460,7 @@ impl Core {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
+                    self.record_allowed(n);
                     return Some(wait);
                 }
                 Err(actual) => {
@@ -473,6 +504,37 @@ impl Core {
             self.units(now).saturating_sub(self.burst()),
             Ordering::Relaxed,
         );
+    }
+
+    #[inline]
+    fn record_allowed(&self, tokens: u32) {
+        #[cfg(feature = "metrics")]
+        {
+            let _ = self.counters.allowed.fetch_add(1, Ordering::Relaxed);
+            let _ = self
+                .counters
+                .tokens_granted
+                .fetch_add(u64::from(tokens), Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "metrics"))]
+        let _ = tokens;
+    }
+
+    #[inline]
+    fn record_denied(&self) {
+        #[cfg(feature = "metrics")]
+        {
+            let _ = self.counters.denied.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(feature = "metrics")]
+    pub(crate) fn metrics(&self) -> BucketMetrics {
+        BucketMetrics::new(
+            self.counters.allowed.load(Ordering::Relaxed),
+            self.counters.denied.load(Ordering::Relaxed),
+            self.counters.tokens_granted.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -772,6 +834,29 @@ impl BucketCore {
     pub const fn config(&self) -> BucketConfig {
         self.core.config()
     }
+
+    /// Returns a snapshot of the bucket's decision counters.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::{BucketConfig, BucketCore};
+    /// use core::time::Duration;
+    ///
+    /// let config = BucketConfig::new(1, 1, Duration::from_secs(1), 1)?;
+    /// let bucket = BucketCore::new(config, Duration::ZERO);
+    /// let _ = bucket.try_acquire_at(1, Duration::ZERO);
+    /// let _ = bucket.try_acquire_at(1, Duration::ZERO);
+    /// let m = bucket.metrics();
+    /// assert_eq!((m.allowed, m.denied, m.tokens_granted), (1, 1, 1));
+    /// # Ok::<(), better_bucket::BucketError>(())
+    /// ```
+    #[cfg(feature = "metrics")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
+    #[must_use]
+    pub fn metrics(&self) -> BucketMetrics {
+        self.core.metrics()
+    }
 }
 
 impl core::fmt::Debug for BucketCore {
@@ -815,8 +900,10 @@ mod tests {
 
     #[test]
     fn test_core_size_is_one_cache_line() {
+        #[cfg(not(feature = "metrics"))]
         assert_eq!(core::mem::size_of::<Core>(), 48);
         assert_eq!(core::mem::align_of::<BucketCore>(), 64);
+        #[cfg(not(feature = "metrics"))]
         assert_eq!(core::mem::size_of::<BucketCore>(), 64);
     }
 

@@ -91,6 +91,7 @@
 //! | `std`   | yes     | Standard library. Off → `no_std`; [`BucketCore`] and the config/decision/error types remain. |
 //! | `clock` | yes     | [`Bucket`] and the [`clock-lib`](https://crates.io/crates/clock-lib) time source, plus a mockable clock for deterministic tests. Implies `std`; brings `error_forge::ForgeError` for [`BucketError`]. |
 //! | `serde` | no      | `Serialize` / validating `Deserialize` for [`BucketConfig`]. |
+//! | `metrics` | no    | Allowed / denied / granted-token counters on every bucket. Zero cost when off. |
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -126,6 +127,8 @@ mod decision;
 #[cfg(target_has_atomic = "64")]
 mod engine;
 mod error;
+#[cfg(feature = "metrics")]
+mod metrics;
 
 #[cfg(feature = "clock")]
 #[cfg_attr(docsrs, doc(cfg(feature = "clock")))]
@@ -136,6 +139,9 @@ pub use crate::decision::Decision;
 #[cfg(target_has_atomic = "64")]
 pub use crate::engine::BucketCore;
 pub use crate::error::BucketError;
+#[cfg(feature = "metrics")]
+#[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
+pub use crate::metrics::BucketMetrics;
 
 /// The version of this crate, taken from `Cargo.toml` at compile time.
 ///
