@@ -69,6 +69,13 @@ What changed, honestly:
   a mix of grants and denials.
 - **The deny path** (computing `retry_after`, one 128-bit division) costs about
   twice a grant; `time_until` is the same computation without the decision.
+- **Exact whole-token charging up to ~4.3 × 10^9 tokens/second** (one extra
+  multiply in the clock conversion, taken only by buckets of 10^9 tokens/second
+  and above) was measured A/B against the engine without it, interleaved in one
+  session on a loaded host: `algorithm_only` 9.3 / 8.0 ns before vs 8.4 / 8.0 ns
+  after, `core/acquire_at` 6.4 / 5.7 vs 6.4 / 6.4 ns, single-thread 35.2 / 34.2
+  vs 35.4 / 34.0 ns — no difference beyond run-to-run noise. (Absolute figures
+  in that session ran 20–30% above the table, because of the host load.)
 
 > The contended figures are host-sensitive: the benchmark takes the slowest
 > thread's time, so on a non-isolated machine a single descheduled thread inflates
