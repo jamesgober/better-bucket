@@ -37,7 +37,7 @@ use crate::error::BucketError;
 /// assert_eq!(config.initial(), 0);
 /// # Ok::<(), better_bucket::BucketError>(())
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BucketConfig {
     capacity: u32,
     refill_amount: u32,

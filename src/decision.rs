@@ -35,7 +35,7 @@ use core::time::Duration;
 /// ```
 #[must_use]
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Decision {
     /// The tokens were granted and have been deducted from the bucket.
     Allowed,

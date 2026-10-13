@@ -37,7 +37,7 @@ use error_forge::ForgeError;
 /// assert_eq!(err, BucketError::ZeroCapacity);
 /// ```
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BucketError {
     /// The capacity was zero. A bucket that can hold no tokens can never grant
     /// one; supply a capacity of at least `1`.
