@@ -97,9 +97,10 @@ fn loom_advancing_clock_never_over_grants() {
     // read the stale reading as a ~49.7-day gap and granted 3 of 2 tokens.
     loom::model(|| {
         let clock = std::sync::Arc::new(LoomClock::new(1, Duration::from_millis(1)));
-        let bucket = loom::sync::Arc::new(
-            Bucket::from_config(per_second(2, 2)).with_clock(std::sync::Arc::clone(&clock)),
-        );
+        let bucket = loom::sync::Arc::new(Bucket::with_config_and_clock(
+            per_second(2, 2),
+            std::sync::Arc::clone(&clock),
+        ));
 
         let a = loom::sync::Arc::clone(&bucket);
         let b = loom::sync::Arc::clone(&bucket);
@@ -128,9 +129,10 @@ fn loom_stale_reader_with_two_advances_never_over_grants() {
     loom::model(|| {
         let clock = std::sync::Arc::new(LoomClock::new(2, Duration::from_millis(1)));
         let config = BucketConfig::new(2, 1_000, Duration::from_secs(1), 2).unwrap();
-        let bucket = loom::sync::Arc::new(
-            Bucket::from_config(config).with_clock(std::sync::Arc::clone(&clock)),
-        );
+        let bucket = loom::sync::Arc::new(Bucket::with_config_and_clock(
+            config,
+            std::sync::Arc::clone(&clock),
+        ));
 
         let a = loom::sync::Arc::clone(&bucket);
         let b = loom::sync::Arc::clone(&bucket);
@@ -188,9 +190,10 @@ fn loom_reset_racing_acquire_is_bounded() {
     // bounded by two bursts — and the state must never corrupt.
     loom::model(|| {
         let clock = std::sync::Arc::new(LoomClock::new(1, Duration::from_millis(1)));
-        let bucket = loom::sync::Arc::new(
-            Bucket::from_config(per_second(2, 2)).with_clock(std::sync::Arc::clone(&clock)),
-        );
+        let bucket = loom::sync::Arc::new(Bucket::with_config_and_clock(
+            per_second(2, 2),
+            std::sync::Arc::clone(&clock),
+        ));
 
         let a = loom::sync::Arc::clone(&bucket);
         let b = loom::sync::Arc::clone(&bucket);

@@ -118,7 +118,6 @@ extern crate std;
 
 #[cfg(feature = "clock")]
 mod bucket;
-#[cfg(feature = "clock")]
 mod builder;
 mod config;
 mod decision;
@@ -130,7 +129,6 @@ mod error;
 #[cfg(feature = "clock")]
 #[cfg_attr(docsrs, doc(cfg(feature = "clock")))]
 pub use crate::bucket::{Bucket, TokenBucket};
-#[cfg(feature = "clock")]
 pub use crate::builder::BucketBuilder;
 pub use crate::config::BucketConfig;
 pub use crate::decision::Decision;

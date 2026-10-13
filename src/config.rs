@@ -20,6 +20,11 @@ use crate::error::BucketError;
 /// `initial` is clamped to `capacity`: asking a bucket to start with more
 /// tokens than it can hold simply starts it full.
 ///
+/// Every value `new` accepts is represented exactly by the bucket: there is no
+/// capacity ceiling below `u32::MAX` and no rate too slow to refill, so
+/// [`Bucket::capacity`](crate::Bucket::capacity) always equals
+/// [`capacity`](Self::capacity).
+///
 /// # Examples
 ///
 /// ```
@@ -80,7 +85,21 @@ impl BucketConfig {
     /// assert_eq!(config.initial(), 100); // clamped to capacity
     /// # Ok::<(), better_bucket::BucketError>(())
     /// ```
-    pub fn new(
+    ///
+    /// `new` is a `const fn`, so a configuration can be validated at compile
+    /// time — handy for a `static` bucket on an embedded target:
+    ///
+    /// ```
+    /// use better_bucket::BucketConfig;
+    /// use std::time::Duration;
+    ///
+    /// const LIMIT: BucketConfig = match BucketConfig::new(10, 10, Duration::from_secs(1), 10) {
+    ///     Ok(config) => config,
+    ///     Err(_) => panic!("invalid bucket configuration"),
+    /// };
+    /// assert_eq!(LIMIT.capacity(), 10);
+    /// ```
+    pub const fn new(
         capacity: u32,
         refill_amount: u32,
         refill_period: Duration,

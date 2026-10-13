@@ -43,6 +43,7 @@ const fn tier1_config(capacity: u32, amount: u32, period: Duration, initial: u32
 /// The type parameter `C` is the time source. It defaults to
 /// [`SystemClock`](clock_lib::SystemClock) (the OS monotonic clock); inject a
 /// [`ManualClock`](clock_lib::ManualClock) with
+/// [`with_config_and_clock`](Self::with_config_and_clock) or
 /// [`with_clock`](Self::with_clock) to drive time by hand in tests. `Bucket` is
 /// `Send + Sync` whenever its clock is, which every [`Clock`] implementation
 /// guarantees.
@@ -89,17 +90,6 @@ pub struct Bucket<C: Clock = SystemClock> {
     created_at: Monotonic,
     /// The injected time source.
     clock: C,
-}
-
-/// Constructs a bucket from a finished config and a clock, holding its initial
-/// tokens as of the clock's current reading.
-fn build<C: Clock>(config: BucketConfig, clock: C) -> Bucket<C> {
-    let created_at = clock.now();
-    Bucket {
-        core: Core::new(config, Duration::ZERO),
-        created_at,
-        clock,
-    }
 }
 
 impl Bucket<SystemClock> {
@@ -167,17 +157,55 @@ impl Bucket<SystemClock> {
     /// ```
     #[must_use]
     pub fn from_config(config: BucketConfig) -> Self {
-        build(config, SystemClock::new())
+        Self::with_config_and_clock(config, SystemClock::new())
     }
 }
 
 impl<C: Clock> Bucket<C> {
+    /// Creates a bucket from a [`BucketConfig`] and a clock in one step,
+    /// holding its initial tokens as of the clock's current reading.
+    ///
+    /// This is the clock-injection constructor: it reads the clock once and
+    /// builds once, where `from_config(config).with_clock(clock)` builds a
+    /// `SystemClock` bucket first and then rebuilds it. Use it wherever a
+    /// consumer creates buckets with an injected clock (per-key buckets in a
+    /// rate limiter, tests).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::{Bucket, BucketConfig};
+    /// use clock_lib::ManualClock;
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// let clock = Arc::new(ManualClock::new());
+    /// let config = BucketConfig::new(100, 10, Duration::from_secs(1), 0)?;
+    /// let bucket = Bucket::with_config_and_clock(config, Arc::clone(&clock));
+    ///
+    /// assert_eq!(bucket.available(), 0);
+    /// clock.advance(Duration::from_secs(1));
+    /// assert_eq!(bucket.available(), 10);
+    /// # Ok::<(), better_bucket::BucketError>(())
+    /// ```
+    #[must_use]
+    pub fn with_config_and_clock(config: BucketConfig, clock: C) -> Self {
+        let created_at = clock.now();
+        Self {
+            core: Core::new(config, Duration::ZERO),
+            created_at,
+            clock,
+        }
+    }
+
     /// Replaces the bucket's time source, resetting it to its initial fill
     /// anchored at the new clock's current reading.
     ///
     /// Tokens already taken from `self` are forgotten: the result is a fresh
-    /// bucket with the same configuration. The intended use is immediately after
-    /// construction — chiefly in tests, where injecting a
+    /// bucket with the same configuration. Prefer
+    /// [`with_config_and_clock`](Self::with_config_and_clock) when building
+    /// from scratch; this remains for chaining onto the Tier-1 constructors,
+    /// chiefly in tests, where injecting a
     /// [`ManualClock`](clock_lib::ManualClock) makes refill behaviour
     /// deterministic with no `sleep`.
     ///
@@ -200,7 +228,7 @@ impl<C: Clock> Bucket<C> {
     /// ```
     #[must_use]
     pub fn with_clock<C2: Clock>(self, clock: C2) -> Bucket<C2> {
-        build(self.core.config(), clock)
+        Bucket::with_config_and_clock(self.core.config(), clock)
     }
 
     /// Attempts to take `n` tokens, returning the full [`Decision`].
@@ -394,6 +422,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::{Bucket, TokenBucket};
+    use crate::config::BucketConfig;
     use crate::decision::Decision;
     use clock_lib::{ManualClock, SystemClock};
     use core::time::Duration;
@@ -634,6 +663,18 @@ mod tests {
         assert_eq!(core::mem::align_of::<Bucket<SystemClock>>(), 64);
         #[cfg(target_pointer_width = "64")]
         assert_eq!(core::mem::size_of::<Bucket<SystemClock>>(), 64);
+    }
+
+    #[test]
+    fn test_with_config_and_clock_builds_once_at_the_clock_reading() {
+        let clock = Arc::new(ManualClock::new());
+        clock.advance(Duration::from_secs(3_600)); // the clock is not at zero
+        let config = BucketConfig::new(10, 10, Duration::from_secs(1), 0).unwrap();
+        let bucket = Bucket::with_config_and_clock(config, Arc::clone(&clock));
+        assert_eq!(bucket.available(), 0);
+        assert_eq!(bucket.config(), config);
+        clock.advance(Duration::from_millis(700));
+        assert_eq!(bucket.available(), 7);
     }
 
     #[test]

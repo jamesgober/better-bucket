@@ -88,7 +88,7 @@ std = ["clock-lib?/std"]
 
 # Pluggable clock source (clock-lib): monotonic time + a mockable clock for
 # deterministic, sleep-free tests. On by default. Gates `Bucket<C>`, the
-# `TokenBucket` trait, and `BucketBuilder`.
+# `TokenBucket` trait, and `BucketBuilder::build`.
 #
 # `clock` implies `std` because clock-lib's `Clock` trait (and `ManualClock`)
 # are themselves std-gated. It also brings the `error_forge::ForgeError` impl

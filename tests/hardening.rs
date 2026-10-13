@@ -57,9 +57,8 @@ fn test_capacity_above_old_clamp_is_honoured() {
     let bucket = Bucket::builder()
         .capacity(10_000_000)
         .refill(10_000_000, Duration::from_secs(1))
-        .build()
-        .unwrap()
-        .with_clock(Arc::clone(&clock));
+        .build_with_clock(Arc::clone(&clock))
+        .unwrap();
     assert_eq!(bucket.capacity(), 10_000_000);
     assert_eq!(bucket.config().capacity(), 10_000_000);
     assert_eq!(bucket.acquire(5_000_000), Decision::Allowed);
