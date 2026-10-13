@@ -29,23 +29,30 @@
 //! # Units
 //!
 //! One unit is `2^-unit_shift` tokens, so token amounts — grants, refunds, the
-//! capacity — are exact shifts: there is no rounding anywhere in the token
-//! accounting, and a bucket with no refill conserves every token. `unit_shift`
-//! is chosen per bucket as fine as the word allows: the capacity must fit in 61
-//! bits of units, and the clock must advance less than one unit per
-//! nanosecond, so it lasts at least ~438 years before it saturates. That puts a
-//! unit at or below one token for every rate below 10^9 tokens/second; only
-//! faster buckets count in multi-token units, rounding each grant up to a whole
-//! unit.
+//! capacity — are exact shifts whenever a unit is at most one token: there is
+//! no rounding in the token accounting, and a bucket with no refill conserves
+//! every token. `unit_shift` is chosen per bucket as fine as the word allows:
+//!
+//! - the capacity must fit in 61 bits of units;
+//! - below 10^9 tokens/second the clock must advance less than one unit per
+//!   nanosecond, so it lasts at least ~438 years before it saturates;
+//! - at 10^9 tokens/second and above, a unit is one whole token as long as the
+//!   clock stays at or below 4.3 units per nanosecond (at least ~100 years of
+//!   range). That covers every `u32` amount per second. Only faster buckets
+//!   (above ~4.3 × 10^9 tokens/second, which needs a sub-second period) count
+//!   in multi-token units and round each grant up to a whole unit.
 //!
 //! The clock reading, in nanoseconds since the bucket's epoch, is converted to
-//! units as the high word of one 64×64-bit multiply by the rate in `Q64`
-//! (`rate_q / 2^64` units per nanosecond), rounded **up**. The conversion is a
-//! function of the absolute reading, not of the history, so its error never
-//! accumulates: over the whole clock range the bucket's clock is less than one
-//! unit ahead of exact, and an instant at which a token is exactly due (500 ms
-//! into a 10/s bucket) is never missed. Instants are offset by [`ORIGIN`] so the
-//! initial state never underflows. Nothing wraps.
+//! units by multiplying by the rate, held as an integer part (`rate_int`, zero
+//! below 10^9 tokens/second, at most 4) and a `Q64` fraction (`rate_frac`),
+//! rounded **up**: the high word of one 64×64-bit multiply, plus one more
+//! multiply only for the fastest buckets. The conversion is a function of the
+//! absolute reading, not of the history, so its error never accumulates: over
+//! the whole clock range the bucket's clock is less than one unit ahead of
+//! exact, and an instant at which a token is exactly due (500 ms into a 10/s
+//! bucket) is never missed. Instants are offset by [`ORIGIN`] so the initial
+//! state never underflows. Nothing wraps; once the clock saturates it stops,
+//! and a charge that would land past its end is refused.
 
 use core::time::Duration;
 
@@ -88,13 +95,21 @@ fn bits(x: u128) -> i32 {
 /// The per-bucket unit and clock rate, derived once at construction.
 #[derive(Clone, Copy)]
 struct Scale {
-    /// Units per nanosecond in `Q64`, rounded up. At least 1, and below 2^64
-    /// because the clock advances less than one unit per nanosecond.
-    rate_q: u64,
-    /// One unit is `2^-unit_shift` tokens. Negative only for rates of 10^9
-    /// tokens/second and above.
+    /// Whole units per nanosecond: zero below 10^9 tokens/second, at most 4.
+    rate_int: u8,
+    /// The fractional units per nanosecond in `Q64`. Together with
+    /// `rate_int` the rate is rounded up and is never zero.
+    rate_frac: u64,
+    /// One unit is `2^-unit_shift` tokens. Negative only above ~4.3 × 10^9
+    /// tokens/second.
     unit_shift: i8,
 }
+
+/// The fastest the clock may run when a unit is one token or more: 4.3 units
+/// per nanosecond (`43 / 10`), enough for every `u32` amount per second while
+/// keeping at least ~100 years of range.
+const FAST_CLOCK_NUM: u128 = 43;
+const FAST_CLOCK_DEN: u128 = 10;
 
 impl Scale {
     /// The rate for a bucket that refills `amount` tokens every `period` and
@@ -103,9 +118,11 @@ impl Scale {
     /// is consulted.
     fn derive(capacity: u32, amount: u32, period: Duration) -> Self {
         if capacity == 0 || amount == 0 || period.is_zero() {
-            // rate_q = 1 keeps the clock at zero for 584 years: frozen.
+            // A rate of 2^-64 units/ns keeps the clock at zero for 584 years:
+            // frozen.
             return Self {
-                rate_q: 1,
+                rate_int: 0,
+                rate_frac: 1,
                 unit_shift: 0,
             };
         }
@@ -127,21 +144,38 @@ impl Scale {
         while !below(clock_limit) {
             clock_limit -= 1;
         }
+        if clock_limit < 0 {
+            // 10^9 tokens/second or faster. Rather than coarsen the unit until
+            // the clock is below one unit per ns, keep whole tokens (or the
+            // finest multi-token unit) while the clock stays at or below
+            // 4.3 units/ns: the largest m <= 0 with
+            // 10 · amount · 2^m <= 43 · period_ns.
+            let fits = |m: i32| {
+                FAST_CLOCK_DEN * amount <= (FAST_CLOCK_NUM * period_ns) << m.unsigned_abs()
+            };
+            clock_limit = 0;
+            while !fits(clock_limit) {
+                clock_limit -= 1;
+            }
+        }
         let unit_shift = burst_limit.min(clock_limit);
 
-        // rate_q = ceil(amount · 2^(unit_shift + 64) / period_ns). A period
-        // wider than 64 bits is first rounded *down* to 64 significant bits,
-        // which can only raise the estimate, keeping the direction of every
-        // rounding the same: the bucket's clock may run a hair fast, never
-        // slow. The numerator stays below 2^128 because the rate is below one
-        // unit per ns (amount · 2^unit_shift < period_ns), and its shift is
-        // positive because unit_shift >= -32 and the period has at most 95 bits.
+        // rate = ceil(amount · 2^(unit_shift + 64) / period_ns), in Q64. A
+        // period wider than 64 bits is first rounded *down* to 64 significant
+        // bits, which can only raise the estimate, keeping the direction of
+        // every rounding the same: the bucket's clock may run a hair fast,
+        // never slow. The numerator stays below 2^128: below 10^9 tokens/s the
+        // rate is under one unit per ns (amount · 2^unit_shift < period_ns);
+        // above it the period has at most 32 bits, nothing is dropped, and
+        // unit_shift <= 0. The shift is positive because unit_shift >= -32 and
+        // the period has at most 95 bits.
         let drop = (bits(period_ns) - 64).max(0);
         let period_top = period_ns >> drop.unsigned_abs();
         let shift = unit_shift + 64 - drop;
-        let rate_q = (amount << shift.unsigned_abs()).div_ceil(period_top);
+        let rate = (amount << shift.unsigned_abs()).div_ceil(period_top);
         Self {
-            rate_q: u64::try_from(rate_q).unwrap_or(u64::MAX),
+            rate_int: u8::try_from(rate >> 64).unwrap_or(u8::MAX),
+            rate_frac: u64::try_from(rate & u128::from(u64::MAX)).unwrap_or(u64::MAX),
             unit_shift: i8::try_from(unit_shift).unwrap_or(i8::MIN),
         }
     }
@@ -161,14 +195,16 @@ pub(crate) struct Core {
     /// The empty-instant `z`, in units offset by [`ORIGIN`]. The only mutable
     /// accounting state and the single point of synchronisation.
     state: AtomicU64,
-    /// See [`Scale::rate_q`].
-    rate_q: u64,
+    /// See [`Scale::rate_frac`].
+    rate_frac: u64,
     /// `refill_period`, split so the struct has no padding hole.
     period_secs: u64,
     capacity: u32,
     refill_amount: u32,
     initial: u32,
     period_nanos: u32,
+    /// See [`Scale::rate_int`].
+    rate_int: u8,
     /// See [`Scale::unit_shift`].
     unit_shift: i8,
     #[cfg(feature = "metrics")]
@@ -186,12 +222,13 @@ impl Core {
         let period = config.refill_period();
         let core = Self {
             state: AtomicU64::new(0),
-            rate_q: rate.rate_q,
+            rate_frac: rate.rate_frac,
             period_secs: period.as_secs(),
             capacity: config.capacity(),
             refill_amount: config.refill_amount(),
             initial: config.initial(),
             period_nanos: period.subsec_nanos(),
+            rate_int: rate.rate_int,
             unit_shift: rate.unit_shift,
             #[cfg(feature = "metrics")]
             counters: Counters {
@@ -223,19 +260,24 @@ impl Core {
     }
 
     /// The clock reading `now` as an offset instant in units: the high word of
-    /// one 64×64-bit multiply. Saturates (the clock stops) after at least
-    /// ~438 years; never wraps.
+    /// one 64×64-bit multiply, plus one more multiply for buckets of 10^9
+    /// tokens/second and above. Saturates (the clock stops) after at least
+    /// ~100 years (~438 years below 10^9 tokens/second); never wraps.
     #[inline]
     fn units(&self, now: Duration) -> u64 {
-        let product = u128::from(duration_nanos(now)) * u128::from(self.rate_q);
-        // The high word of a u64 × u64 product always fits a u64.
-        let accrued = u64::try_from(product >> 64).unwrap_or(u64::MAX);
-        ORIGIN.saturating_add(accrued)
+        let ns = u128::from(duration_nanos(now));
+        let mut accrued = (ns * u128::from(self.rate_frac)) >> 64;
+        if self.rate_int != 0 {
+            // At most 2^64 · 4, so the sum stays far inside a u128.
+            accrued += ns * u128::from(self.rate_int);
+        }
+        ORIGIN.saturating_add(u64::try_from(accrued).unwrap_or(u64::MAX))
     }
 
-    /// Units that `n` tokens cost. Exact when a unit is at most one token;
-    /// rounded up to whole units for the very fastest buckets. For
-    /// `n <= capacity` this is at most the burst, below 2^61.
+    /// Units that `n` tokens cost. Exact when a unit is at most one token (every
+    /// rate up to ~4.3 × 10^9 tokens/second); rounded up to whole units for
+    /// faster buckets. For `n <= capacity` this is at most the burst, below
+    /// 2^61.
     #[inline]
     fn cost(&self, n: u32) -> u64 {
         let n = u64::from(n);
@@ -274,10 +316,11 @@ impl Core {
     /// i.e. the wait can never end.
     fn wait_until(&self, target: u64, now: Duration) -> Option<Duration> {
         // The first nanosecond reading `e` with units(e) >= target is
-        // ceil(d · 2^64 / rate_q), where d < 2^64 is target's offset and
-        // rate_q >= 1.
+        // ceil(d · 2^64 / rate), where d < 2^64 is target's offset and the
+        // Q64 rate is at least 1.
+        let rate = (u128::from(self.rate_int) << 64) | u128::from(self.rate_frac);
         let d = u128::from(target.saturating_sub(ORIGIN));
-        let due_ns = (d << 64).div_ceil(u128::from(self.rate_q));
+        let due_ns = (d << 64).div_ceil(rate);
         // Readings saturate at u64::MAX ns, so anything later never arrives.
         if due_ns > u128::from(u64::MAX) {
             return None;
@@ -1221,16 +1264,47 @@ mod tests {
 
     #[test]
     fn test_core_extreme_fast_rate_does_not_overflow() {
-        // ~4.3 × 10^18 tokens/s: a unit is 2^32 tokens, so a grant rounds up to
-        // a whole unit (the full capacity here), but nothing overflows and the
-        // bucket refills within two nanoseconds.
+        // ~4.3 × 10^18 tokens/s: a unit is 2^30 tokens, so a grant rounds up to
+        // a whole unit, but nothing overflows and the bucket refills within two
+        // nanoseconds.
         let bucket = core(u32::MAX, u32::MAX, Duration::from_nanos(1), u32::MAX);
+        let two_ns = Duration::from_nanos(2);
         assert!(bucket.try_acquire_at(u32::MAX, T0));
         assert_eq!(bucket.available_at(T0), 0);
-        assert_eq!(bucket.available_at(Duration::from_nanos(2)), u32::MAX);
-        assert!(bucket.try_acquire_at(1, Duration::from_nanos(2)));
-        assert!(!bucket.try_acquire_at(1, Duration::from_nanos(2)));
+        assert!(bucket.available_at(Duration::from_nanos(1)) >= 3 << 30);
+        assert_eq!(bucket.available_at(two_ns), u32::MAX);
+        assert!(bucket.try_acquire_at(1, two_ns));
+        // One token cost a whole 2^30-token unit.
+        assert_eq!(bucket.available_at(two_ns), u32::MAX - (1 << 30) + 1);
         assert!(bucket.try_acquire_at(1, Duration::MAX));
+    }
+
+    #[test]
+    fn test_core_fast_per_second_rates_charge_exactly_one_token() {
+        // 10^9 to u32::MAX tokens per second: every grant costs exactly what it
+        // asks for, refill is exact, and the clock still lasts a century.
+        for rate in [1_000_000_000_u32, 2_000_000_000, 3_000_000_000, u32::MAX] {
+            let bucket = core(rate, rate, Duration::from_secs(1), rate);
+            assert!(bucket.try_acquire_at(1, T0));
+            assert_eq!(bucket.available_at(T0), rate - 1, "{rate}/s");
+            let mut drained = 1_u64;
+            while bucket.try_acquire_at(1_000_000, T0) {
+                drained += 1_000_000;
+            }
+            drained += u64::from(bucket.acquire_up_to_at(u32::MAX, T0));
+            assert_eq!(drained, u64::from(rate), "{rate}/s conserves");
+            // One millisecond accrues exactly rate / 1000 tokens.
+            assert_eq!(
+                u64::from(bucket.available_at(ms(1))),
+                u64::from(rate) / 1_000
+            );
+            let century = Duration::from_secs(100 * 365 * 86_400);
+            assert_eq!(bucket.available_at(century), rate);
+        }
+        // Ten tokens at 3 × 10^9/s: a full bucket grants ten single tokens.
+        let small = core(10, 3_000_000_000, Duration::from_secs(1), 10);
+        let granted = (0..20).filter(|_| small.try_acquire_at(1, T0)).count();
+        assert_eq!(granted, 10);
     }
 
     #[test]
@@ -1322,17 +1396,23 @@ mod tests {
             for &amount in &[1_u32, 7, 1_000_000, u32::MAX] {
                 for &period in &periods {
                     let rate = Scale::derive(capacity, amount, period);
-                    assert!(rate.rate_q >= 1);
+                    assert!(rate.rate_int > 0 || rate.rate_frac > 0);
+                    assert!(rate.rate_int <= 4);
                     assert!((-32..=60).contains(&rate.unit_shift));
                     let config = BucketConfig::new(capacity, amount, period, capacity).unwrap();
                     let core = Core::new(config, T0);
                     let burst = core.burst();
                     assert!(burst <= 1 << BURST_BITS.unsigned_abs());
                     assert!(burst < ORIGIN);
-                    // The clock never runs faster than one unit per ns, so it
-                    // lasts at least ~438 years before saturating.
+                    // The clock never runs faster than 4.3 units per ns (one
+                    // below 10^9 tokens/s), so it lasts at least ~100 years
+                    // (~438) before saturating.
                     let one_sec = core.units(Duration::from_secs(1)) - ORIGIN;
-                    assert!(one_sec <= 1_000_000_000, "{one_sec}");
+                    assert!(one_sec <= 4_300_000_001, "{one_sec}");
+                    if u128::from(amount) * 1_000_000_000 < period.as_nanos() * 1_000_000_000 {
+                        // Below one token per ns.
+                        assert!(one_sec <= 1_000_000_000, "{one_sec}");
+                    }
                     // A full bucket grants exactly its capacity.
                     assert_eq!(core.available(T0), capacity);
                     assert_eq!(core.tokens_for(burst), capacity);

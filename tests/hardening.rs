@@ -41,12 +41,15 @@ fn test_request_at_u32_max_never_panics_and_is_denied_forever() {
 
 #[test]
 fn test_capacity_at_u32_max_constructs_and_works() {
-    // Capacity is exact for every u32 — no clamp — and the bucket still grants.
-    let bucket = Bucket::per_second(u32::MAX);
+    // Capacity is exact for every u32 — no clamp — and a one-token grant costs
+    // exactly one token, even at ~4.3 × 10^9 tokens/second.
+    let (_clock, bucket) = manual(u32::MAX);
     assert_eq!(bucket.capacity(), u32::MAX);
     assert_eq!(bucket.capacity(), bucket.config().capacity());
     assert!(bucket.try_acquire(1));
-    assert!(bucket.available() <= bucket.capacity());
+    assert_eq!(bucket.available(), u32::MAX - 1);
+    assert!(bucket.try_acquire(7));
+    assert_eq!(bucket.available(), u32::MAX - 8);
 }
 
 #[test]
