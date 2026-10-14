@@ -348,7 +348,9 @@ cargo test --features serde,metrics
 cargo test --no-default-features              # the no_std core (tests themselves use std)
 cargo build --no-default-features --features portable-atomic --target thumbv7em-none-eabihf
 
-# Concurrency model checking (advancing clock, every interleaving)
+# Concurrency model checking (advancing clock, every interleaving).
+# clock-lib 1.1.0 does not build under cfg(loom); pin 1.0.0 first.
+cargo update -p clock-lib --precise 1.0.0
 RUSTFLAGS="--cfg loom" cargo test --release --test loom_acquire
 
 # Miri (UB check)

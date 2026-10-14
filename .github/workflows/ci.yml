@@ -110,6 +110,10 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # clock-lib 1.1.0 uses loom in library code under cfg(loom) without
+      # declaring it as a dependency, so pin the last release that builds.
+      - name: Pin clock-lib for loom
+        run: cargo update -p clock-lib --precise 1.0.0
       - name: Loom
         run: cargo test --release --test loom_acquire
         env:
