@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "better-bucket"
-version = "1.0.0"
+version = "1.1.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -22,7 +22,7 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Description
-description = "A genuinely better token bucket for Rust: lock-free, allocation-free acquire path, cache-aligned, overflow-safe, with a one-line Tier-1 API and a mockable clock for deterministic tests."
+description = "A lock-free, allocation-free token bucket that never over-grants under contention: one atomic word, nanosecond refill, no wrap, a no_std caller-driven core, a one-line API, and a mockable clock for deterministic tests."
 
 # Keywords (5 max)
 keywords = [
@@ -51,10 +51,9 @@ authors = [
 ]
 
 [package.metadata.docs.rs]
-# The full functional surface is the default features (std + clock); the
-# `comparison` feature is benchmark-only and must not pull `governor` into the
-# docs build.
-features = ["std", "clock"]
+# Every runtime feature; the `comparison` feature is benchmark-only and must not
+# pull `governor` into the docs build.
+features = ["std", "clock", "forge", "serde", "metrics"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [lib]
@@ -80,18 +79,40 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 # Default build: std on, monotonic system clock available.
 default = ["std", "clock"]
 
-# Standard library. With it off, the crate is `no_std`. The lock-free accounting
-# core needs only `core` atomics, but the `Bucket` surface reads the clock, so a
-# bare `no_std` build exposes only `VERSION`. Propagates std to clock-lib when
-# the `clock` feature is on.
+# Standard library. With it off, the crate is `no_std`: `BucketCore` (the
+# caller-driven engine), `BucketConfig`, `BucketBuilder::build_config`,
+# `Decision`, and `BucketError` remain, needing only `core` and a 64-bit atomic.
+# Propagates std to clock-lib when the `clock` feature is on.
 std = ["clock-lib?/std"]
 
 # Pluggable clock source (clock-lib): monotonic time + a mockable clock for
-# deterministic, sleep-free tests. On by default.
+# deterministic, sleep-free tests. On by default. Gates `Bucket<C>`, the
+# `TokenBucket` trait, and `BucketBuilder::build`.
 #
 # `clock` implies `std` because clock-lib's `Clock` trait (and `ManualClock`)
-# are themselves std-gated. It gates the entire `Bucket` surface.
-clock = ["std", "dep:clock-lib", "dep:error-forge"]
+# are themselves std-gated. It also implies `forge`, so a 1.0 consumer building
+# with `default-features = false, features = ["clock"]` keeps the `ForgeError`
+# impl it had.
+clock = ["std", "dep:clock-lib", "forge"]
+
+# `error_forge::ForgeError` for `BucketError`, slotting it into the portfolio
+# error stack. Implied by `clock`; a core-only (`no_std`) build does not pull
+# error-forge.
+forge = ["std", "dep:error-forge"]
+
+# `serde::Serialize` / `Deserialize` for `BucketConfig`. Deserialization runs
+# the same validation as `BucketConfig::new`. Off by default; no_std-compatible.
+serde = ["dep:serde"]
+
+# Relaxed allowed / denied / granted-token counters on every bucket, read with
+# `metrics()`. Off by default; with it off the counters do not exist (no field,
+# no atomic increment).
+metrics = []
+
+# Use `portable-atomic` for the 64-bit state word. Only needed on targets with
+# no native 64-bit atomics (e.g. thumbv7em, 32-bit MIPS/PowerPC); on every other
+# target it compiles to the same native instructions. Off by default.
+portable-atomic = ["dep:portable-atomic"]
 
 # Benchmark-only: pulls in `governor` for the comparative benchmark
 # (`cargo bench --features comparison --bench comparison`). Never enabled in a
@@ -108,10 +129,20 @@ comparison = ["clock", "dep:governor"]
 # (e.g. rate-net) and tests can substitute a ManualClock.
 clock-lib = { version = "1.0", optional = true, default-features = false }
 
-# Domain error type (config validation) via the portfolio error stack, instead
-# of thiserror/anyhow in a library crate. Only the `ForgeError` trait is used;
-# `BucketError` is hand-written so every variant is documented.
-error-forge = { version = "1.0", optional = true }
+# Domain error type metadata (kind/caption) via the portfolio error stack,
+# instead of thiserror/anyhow in a library crate. Only the `ForgeError` trait is
+# used; `BucketError` is hand-written so every variant is documented. 1.0.2 is
+# the floor because it drops the unused thiserror/syn build dependencies.
+error-forge = { version = "1.0.2", optional = true }
+
+# Config-file support for `BucketConfig`, behind the `serde` feature. derive
+# only, no std, so it works in no_std builds too.
+serde = { version = "1.0.200", optional = true, default-features = false, features = ["derive"] }
+
+# 64-bit atomics on targets without them, behind the `portable-atomic` feature.
+# `fallback` provides the lock-based implementation where no native 64-bit CAS
+# exists; elsewhere the crate is a zero-cost re-export of the native atomics.
+portable-atomic = { version = "1.6", optional = true, default-features = false, features = ["fallback"] }
 
 # Benchmark-only incumbent, behind the `comparison` feature. Used solely by the
 # `comparison` bench to produce the head-to-head numbers in docs/BENCHMARKS.md.
@@ -122,8 +153,10 @@ governor = { version = "0.10", optional = true }
 # DEV DEPENDENCIES
 # #################################
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
-proptest  = "1"
+criterion  = { version = "0.5", features = ["html_reports"] }
+proptest   = "1"
+# Round-trip tests for the `serde` feature.
+serde_json = "1"
 
 # `loom` is pulled in only under `cfg(loom)` model-checking builds
 # (`RUSTFLAGS="--cfg loom" cargo test`). It is a regular (not dev) dependency
@@ -153,7 +186,11 @@ required-features = ["comparison"]
 
 # EXAMPLES
 # #################################
-# All examples drive a `Bucket` and so require the clock feature.
+# `caller_driven` uses only `BucketCore`, so it builds in every configuration;
+# the rest drive a `Bucket` and so require the clock feature.
+[[example]]
+name = "caller_driven"
+
 [[example]]
 name              = "per_second"
 required-features = ["clock"]

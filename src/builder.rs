@@ -2,8 +2,10 @@
 
 use core::time::Duration;
 
-use clock_lib::SystemClock;
+#[cfg(feature = "clock")]
+use clock_lib::{Clock, SystemClock};
 
+#[cfg(feature = "clock")]
 use crate::bucket::Bucket;
 use crate::config::BucketConfig;
 use crate::error::BucketError;
@@ -20,13 +22,15 @@ use crate::error::BucketError;
 /// most `capacity` tokens, so the largest single acquire it can ever grant — the
 /// burst — is `capacity`.
 ///
-/// For a custom time source, chain [`Bucket::with_clock`] onto the built bucket;
-/// the builder itself always produces a [`SystemClock`](clock_lib::SystemClock)
-/// bucket.
+/// [`build`](Self::build) produces a [`SystemClock`](clock_lib::SystemClock)
+/// bucket; [`build_with_clock`](Self::build_with_clock) takes any clock, and
+/// [`build_config`](Self::build_config) stops at the validated
+/// [`BucketConfig`] (the `no_std` path, for a [`BucketCore`](crate::BucketCore)).
 ///
 /// # Examples
 ///
 /// ```
+/// # #[cfg(feature = "clock")] {
 /// use better_bucket::Bucket;
 /// use std::time::Duration;
 ///
@@ -39,6 +43,7 @@ use crate::error::BucketError;
 ///
 /// assert_eq!(bucket.capacity(), 1000);
 /// assert_eq!(bucket.available(), 0);
+/// # }
 /// # Ok::<(), better_bucket::BucketError>(())
 /// ```
 #[derive(Debug, Clone, Default)]
@@ -53,8 +58,13 @@ pub struct BucketBuilder {
 impl BucketBuilder {
     /// Starts a builder with every field at its default (which `build` rejects
     /// until at least a capacity and refill rate are set).
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn new() -> Self {
+        Self {
+            capacity: 0,
+            refill_amount: 0,
+            refill_period: Duration::ZERO,
+            initial: None,
+        }
     }
 
     /// Sets the capacity — the maximum tokens the bucket holds, and therefore
@@ -63,17 +73,17 @@ impl BucketBuilder {
     /// # Examples
     ///
     /// ```
-    /// use better_bucket::Bucket;
+    /// use better_bucket::BucketBuilder;
     /// use std::time::Duration;
     ///
-    /// let bucket = Bucket::builder()
+    /// let config = BucketBuilder::new()
     ///     .capacity(200)
     ///     .refill(200, Duration::from_secs(1))
-    ///     .build()?;
-    /// assert_eq!(bucket.capacity(), 200);
+    ///     .build_config()?;
+    /// assert_eq!(config.capacity(), 200);
     /// # Ok::<(), better_bucket::BucketError>(())
     /// ```
-    pub fn capacity(mut self, capacity: u32) -> Self {
+    pub const fn capacity(mut self, capacity: u32) -> Self {
         self.capacity = capacity;
         self
     }
@@ -83,17 +93,18 @@ impl BucketBuilder {
     /// # Examples
     ///
     /// ```
-    /// use better_bucket::Bucket;
+    /// use better_bucket::BucketBuilder;
     /// use std::time::Duration;
     ///
     /// // 10 tokens every 250ms.
-    /// let bucket = Bucket::builder()
+    /// let config = BucketBuilder::new()
     ///     .capacity(10)
     ///     .refill(10, Duration::from_millis(250))
-    ///     .build()?;
+    ///     .build_config()?;
+    /// assert_eq!(config.refill_period(), Duration::from_millis(250));
     /// # Ok::<(), better_bucket::BucketError>(())
     /// ```
-    pub fn refill(mut self, amount: u32, period: Duration) -> Self {
+    pub const fn refill(mut self, amount: u32, period: Duration) -> Self {
         self.refill_amount = amount;
         self.refill_period = period;
         self
@@ -105,20 +116,58 @@ impl BucketBuilder {
     /// # Examples
     ///
     /// ```
-    /// use better_bucket::Bucket;
+    /// use better_bucket::BucketBuilder;
     /// use std::time::Duration;
     ///
-    /// let bucket = Bucket::builder()
+    /// let config = BucketBuilder::new()
     ///     .capacity(100)
     ///     .refill(100, Duration::from_secs(1))
     ///     .initial(0) // start empty instead of full
-    ///     .build()?;
-    /// assert_eq!(bucket.available(), 0);
+    ///     .build_config()?;
+    /// assert_eq!(config.initial(), 0);
     /// # Ok::<(), better_bucket::BucketError>(())
     /// ```
-    pub fn initial(mut self, initial: u32) -> Self {
+    pub const fn initial(mut self, initial: u32) -> Self {
         self.initial = Some(initial);
         self
+    }
+
+    /// Validates the configuration and returns it, without building a bucket.
+    ///
+    /// Available in every build, including `no_std`: pair it with
+    /// [`BucketCore::new`](crate::BucketCore::new), or keep the config to build
+    /// several buckets from.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`BucketConfig::new`]: zero capacity, zero refill amount, or
+    /// zero refill period.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::{BucketBuilder, BucketCore};
+    /// use std::time::Duration;
+    ///
+    /// let config = BucketBuilder::new()
+    ///     .capacity(20)
+    ///     .refill(5, Duration::from_secs(1))
+    ///     .build_config()?;
+    /// let bucket = BucketCore::new(config, Duration::ZERO);
+    /// assert_eq!(bucket.available_at(Duration::ZERO), 20);
+    /// # Ok::<(), better_bucket::BucketError>(())
+    /// ```
+    pub const fn build_config(self) -> Result<BucketConfig, BucketError> {
+        let initial = match self.initial {
+            Some(initial) => initial,
+            None => self.capacity,
+        };
+        BucketConfig::new(
+            self.capacity,
+            self.refill_amount,
+            self.refill_period,
+            initial,
+        )
     }
 
     /// Validates the configuration and builds the bucket.
@@ -139,18 +188,47 @@ impl BucketBuilder {
     /// let err = Bucket::builder().build().unwrap_err();
     /// assert_eq!(err, BucketError::ZeroCapacity);
     /// ```
+    #[cfg(feature = "clock")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "clock")))]
     pub fn build(self) -> Result<Bucket<SystemClock>, BucketError> {
-        let initial = self.initial.unwrap_or(self.capacity);
-        let config = BucketConfig::new(
-            self.capacity,
-            self.refill_amount,
-            self.refill_period,
-            initial,
-        )?;
-        Ok(Bucket::from_config(config))
+        self.build_with_clock(SystemClock::new())
+    }
+
+    /// Validates the configuration and builds a bucket driven by `clock`.
+    ///
+    /// One build and one clock read, the builder form of
+    /// [`Bucket::with_config_and_clock`].
+    ///
+    /// # Errors
+    ///
+    /// The same as [`build`](Self::build).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::Bucket;
+    /// use clock_lib::ManualClock;
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// let clock = Arc::new(ManualClock::new());
+    /// let bucket = Bucket::builder()
+    ///     .capacity(10)
+    ///     .refill(1, Duration::from_secs(1))
+    ///     .initial(0)
+    ///     .build_with_clock(Arc::clone(&clock))?;
+    /// clock.advance(Duration::from_secs(3));
+    /// assert_eq!(bucket.available(), 3);
+    /// # Ok::<(), better_bucket::BucketError>(())
+    /// ```
+    #[cfg(feature = "clock")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "clock")))]
+    pub fn build_with_clock<C: Clock>(self, clock: C) -> Result<Bucket<C>, BucketError> {
+        Ok(Bucket::with_config_and_clock(self.build_config()?, clock))
     }
 }
 
+#[cfg(feature = "clock")]
 impl Bucket<SystemClock> {
     /// Starts a [`BucketBuilder`] for explicit configuration.
     ///
@@ -171,7 +249,7 @@ impl Bucket<SystemClock> {
     /// # Ok::<(), better_bucket::BucketError>(())
     /// ```
     #[must_use = "a builder does nothing until `.build()` is called"]
-    pub fn builder() -> BucketBuilder {
+    pub const fn builder() -> BucketBuilder {
         BucketBuilder::new()
     }
 }
@@ -181,10 +259,65 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::BucketBuilder;
+    #[cfg(feature = "clock")]
     use crate::bucket::Bucket;
     use crate::error::BucketError;
     use core::time::Duration;
 
+    #[test]
+    fn test_build_config_applies_every_field() {
+        let config = BucketBuilder::new()
+            .capacity(500)
+            .refill(100, Duration::from_secs(2))
+            .initial(7)
+            .build_config()
+            .unwrap();
+        assert_eq!(config.capacity(), 500);
+        assert_eq!(config.refill_amount(), 100);
+        assert_eq!(config.refill_period(), Duration::from_secs(2));
+        assert_eq!(config.initial(), 7);
+    }
+
+    #[test]
+    fn test_build_config_defaults_initial_to_capacity() {
+        let config = BucketBuilder::default()
+            .capacity(9)
+            .refill(1, Duration::from_secs(1))
+            .build_config()
+            .unwrap();
+        assert_eq!(config.initial(), 9);
+    }
+
+    #[test]
+    fn test_builder_is_usable_in_const_context() {
+        const BUILDER: BucketBuilder = BucketBuilder::new()
+            .capacity(3)
+            .refill(3, Duration::from_secs(1))
+            .initial(1);
+        assert_eq!(BUILDER.build_config().unwrap().initial(), 1);
+    }
+
+    #[test]
+    fn test_build_config_rejects_like_new() {
+        assert_eq!(
+            BucketBuilder::new().build_config().unwrap_err(),
+            BucketError::ZeroCapacity
+        );
+        assert_eq!(
+            BucketBuilder::new().capacity(1).build_config().unwrap_err(),
+            BucketError::ZeroRefillAmount
+        );
+        assert_eq!(
+            BucketBuilder::new()
+                .capacity(1)
+                .refill(1, Duration::ZERO)
+                .build_config()
+                .unwrap_err(),
+            BucketError::ZeroRefillPeriod
+        );
+    }
+
+    #[cfg(feature = "clock")]
     #[test]
     fn test_builds_configured_bucket() {
         let bucket = Bucket::builder()
@@ -198,6 +331,7 @@ mod tests {
         assert_eq!(bucket.config().refill_amount(), 100);
     }
 
+    #[cfg(feature = "clock")]
     #[test]
     fn test_initial_defaults_to_full() {
         let bucket = Bucket::builder()
@@ -208,6 +342,7 @@ mod tests {
         assert_eq!(bucket.available(), 40);
     }
 
+    #[cfg(feature = "clock")]
     #[test]
     fn test_empty_builder_is_rejected() {
         assert_eq!(
@@ -216,12 +351,14 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "clock")]
     #[test]
     fn test_missing_refill_is_rejected() {
         let err = Bucket::builder().capacity(10).build().unwrap_err();
         assert_eq!(err, BucketError::ZeroRefillAmount);
     }
 
+    #[cfg(feature = "clock")]
     #[test]
     fn test_zero_period_is_rejected() {
         let err = Bucket::builder()
@@ -230,5 +367,24 @@ mod tests {
             .build()
             .unwrap_err();
         assert_eq!(err, BucketError::ZeroRefillPeriod);
+    }
+
+    #[cfg(feature = "clock")]
+    #[test]
+    fn test_build_with_clock_uses_the_injected_clock() {
+        use clock_lib::ManualClock;
+        use std::sync::Arc;
+
+        let clock = Arc::new(ManualClock::new());
+        let bucket = Bucket::builder()
+            .capacity(4)
+            .refill(4, Duration::from_secs(1))
+            .initial(0)
+            .build_with_clock(Arc::clone(&clock))
+            .unwrap();
+        assert_eq!(bucket.available(), 0);
+        clock.advance(Duration::from_millis(500));
+        assert_eq!(bucket.available(), 2);
+        assert!(Bucket::builder().build_with_clock(clock).is_err());
     }
 }

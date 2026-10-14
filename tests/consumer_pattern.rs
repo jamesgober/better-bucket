@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use better_bucket::{Bucket, BucketConfig, Decision, TokenBucket};
-use clock_lib::ManualClock;
+use clock_lib::{Clock, ManualClock};
 
 /// The kind of allow/deny a gatekeeper exposes — the shape `rate-net` returns to
 /// its callers. Built purely from what the [`TokenBucket`] trait provides.
@@ -104,4 +104,77 @@ fn test_consumer_configures_via_config_then_injects_clock() {
     assert_eq!(bucket.available(), 0); // started empty per the config
     clock.advance(Duration::from_secs(1));
     assert_eq!(bucket.available(), 10); // one second of refill at 10/s
+}
+
+#[test]
+fn test_consumer_builds_per_key_buckets_in_one_step() {
+    // The rate-net construction path from 1.1: config + shared clock, one build
+    // and one clock read per key, and a Retry-After without spending a token.
+    let clock = Arc::new(ManualClock::new());
+    let quota = BucketConfig::new(2, 2, Duration::from_secs(1), 2).unwrap();
+    let make = || Bucket::with_config_and_clock(quota, Arc::clone(&clock));
+    let (alice, bob) = (make(), make());
+
+    let limiter: &dyn TokenBucket = &alice;
+    assert!(limiter.try_acquire(2));
+    assert_eq!(limiter.time_until(1), Some(Duration::from_millis(500)));
+    assert_eq!(limiter.available(), 0); // asking did not spend anything
+    assert_eq!(bob.time_until(2), Some(Duration::ZERO));
+
+    // One clock read decides for every key.
+    clock.advance(Duration::from_millis(500));
+    let now = clock.now();
+    assert!(alice.try_acquire_at(1, now));
+    assert!(bob.try_acquire_at(2, now));
+
+    // A request that failed downstream gives its tokens back.
+    bob.refund(2);
+    assert_eq!(bob.available(), 2);
+
+    // The trait reset clears a key's debt.
+    limiter.reset();
+    assert_eq!(limiter.available(), 2);
+}
+
+#[test]
+fn test_consumer_trait_defaults_for_a_foreign_implementation() {
+    // A consumer's own `TokenBucket` (written against 1.0) keeps compiling, and
+    // the provided methods answer conservatively: `None` only for "never",
+    // `Some(Duration::MAX)` for "not now, wait unknown".
+    struct Fixed {
+        available: u32,
+        capacity: u32,
+    }
+    impl TokenBucket for Fixed {
+        fn acquire(&self, n: u32) -> Decision {
+            if n <= self.available {
+                Decision::Allowed
+            } else {
+                Decision::Denied {
+                    retry_after: Duration::MAX,
+                }
+            }
+        }
+        fn try_acquire(&self, n: u32) -> bool {
+            self.acquire(n).is_allowed()
+        }
+        fn available(&self) -> u32 {
+            self.available
+        }
+        fn capacity(&self) -> u32 {
+            self.capacity
+        }
+    }
+
+    let fixed = Fixed {
+        available: 1,
+        capacity: 3,
+    };
+    assert_eq!(fixed.time_until(0), Some(Duration::ZERO));
+    assert_eq!(fixed.time_until(1), Some(Duration::ZERO));
+    assert_eq!(fixed.time_until(2), Some(Duration::MAX)); // drained, not never
+    assert_eq!(fixed.time_until(3), Some(Duration::MAX));
+    assert_eq!(fixed.time_until(4), None); // above capacity: never
+    fixed.reset(); // provided no-op
+    assert_eq!(fixed.available(), 1);
 }

@@ -1,65 +1,32 @@
-//! The single token bucket and the `TokenBucket` trait.
+//! The clock-driven token bucket and the `TokenBucket` trait.
 //!
-//! This is the lock-free core. All mutable state lives in one `AtomicU64` that
-//! packs the current token count and the time of the last refill; `try_acquire`
-//! is a single `compare_exchange_weak` loop with lazy refill computed from the
-//! injected monotonic clock. There is no lock and no allocation on the acquire
-//! path, and the bucket is cache-line aligned so independent buckets never
-//! falsely share. The public surface is identical to the `0.2` foundation
-//! release — only the internals changed.
+//! [`Bucket`] is the accounting engine (see `engine.rs`) plus an injected
+//! monotonic clock and the instant it was built. Every method that needs the
+//! time reads the clock once and hands the elapsed time to the engine; every
+//! `*_at` twin takes the reading from the caller instead, so one clock read can
+//! serve many buckets and tests can drive time exactly.
 //!
-//! # Packing
-//!
-//! The state word is split:
-//! - **upper 32 bits** — tokens in *millitokens* (thousandths of a token), for
-//!   sub-token refill resolution. Capped at [`u32::MAX`] millitokens, so the
-//!   effective capacity ceiling is about 4.29 million tokens.
-//! - **lower 32 bits** — milliseconds since the bucket's `created_at` anchor of
-//!   the last refill computation.
-//!
-//! The millisecond field wraps every ~49.7 days. Elapsed time is computed with
-//! `wrapping_sub`, so refill stays correct for any gap shorter than that — i.e.
-//! for any bucket used at least once per ~49.7 days, which is every real
-//! limiter. A bucket left fully idle for longer may under-refill once on its
-//! next use, a safe and self-correcting outcome.
+//! All mutable state is one `AtomicU64` holding the instant the bucket would
+//! have been empty, in nanoseconds. A grant is a single `compare_exchange_weak`
+//! that moves that instant forward; a stale or backward clock reading can only
+//! see fewer tokens, never more. Time never wraps (the range is at least a
+//! century) and capacity is exact up to `u32::MAX`.
 
 use core::time::Duration;
 
-#[cfg(loom)]
-use loom::sync::atomic::{AtomicU64, Ordering};
-
 use clock_lib::{Clock, Monotonic, SystemClock};
-#[cfg(not(loom))]
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::BucketConfig;
 use crate::decision::Decision;
-
-/// Millitokens per whole token.
-const MILLI: u64 = 1_000;
-
-/// Fractional bits for the precomputed refill rate. The rate is stored as
-/// millitokens-per-millisecond in `Q(REFILL_FRAC_BITS)` fixed point so the hot
-/// path is a multiply and a shift — no division per acquire.
-const REFILL_FRAC_BITS: u32 = 22;
-
-/// Packs `millitokens` (clamped to 32 bits) and `last_ms` into one word.
-#[inline]
-fn pack(millitokens: u64, last_ms: u32) -> u64 {
-    (millitokens.min(u64::from(u32::MAX)) << 32) | u64::from(last_ms)
-}
-
-/// Unpacks the state word into `(millitokens, last_ms)`.
-#[inline]
-fn unpack(state: u64) -> (u64, u32) {
-    (state >> 32, (state & u64::from(u32::MAX)) as u32)
-}
+use crate::engine::Core;
+#[cfg(feature = "metrics")]
+use crate::metrics::BucketMetrics;
 
 /// Maps a Tier-1 request to a config, collapsing a degenerate request (zero
 /// capacity, amount, or period) to a bucket that grants nothing. That is
 /// well-defined and safe rather than a panic; [`BucketConfig::new`] is the
 /// validated, error-returning path.
-fn tier1_config(capacity: u32, amount: u32, period: Duration, initial: u32) -> BucketConfig {
+const fn tier1_config(capacity: u32, amount: u32, period: Duration, initial: u32) -> BucketConfig {
     if capacity == 0 || amount == 0 || period.is_zero() {
         BucketConfig::raw(0, 0, Duration::from_secs(1), 0)
     } else {
@@ -70,8 +37,9 @@ fn tier1_config(capacity: u32, amount: u32, period: Duration, initial: u32) -> B
 /// A token bucket: a counter that refills over time and grants tokens on demand.
 ///
 /// A bucket holds up to its capacity in tokens, accrues more at a fixed rate,
-/// and hands them out when asked. The hot path is **lock-free** — a single
-/// `compare_exchange_weak` on a packed atomic word — and **allocation-free**.
+/// and hands them out when asked. The hot path is **lock-free** on every target
+/// with native 64-bit atomics — a single
+/// `compare_exchange_weak` on one atomic word — and **allocation-free**.
 /// Refill is **lazy**: there is no background thread or timer, the token count
 /// is brought current from the monotonic clock the instant you call
 /// [`acquire`](Self::acquire), [`try_acquire`](Self::try_acquire), or
@@ -79,17 +47,38 @@ fn tier1_config(capacity: u32, amount: u32, period: Duration, initial: u32) -> B
 ///
 /// The type parameter `C` is the time source. It defaults to
 /// [`SystemClock`](clock_lib::SystemClock) (the OS monotonic clock); inject a
-/// [`ManualClock`](clock_lib::ManualClock) with [`with_clock`](Self::with_clock)
-/// to drive time by hand in tests. `Bucket` is `Send + Sync` whenever its clock
-/// is, which every [`Clock`] implementation guarantees.
+/// [`ManualClock`](clock_lib::ManualClock) with
+/// [`with_config_and_clock`](Self::with_config_and_clock) or
+/// [`with_clock`](Self::with_clock) to drive time by hand in tests. `Bucket` is
+/// `Send + Sync` whenever its clock is, which every [`Clock`] implementation
+/// guarantees.
+///
+/// # Guarantees
+///
+/// Over any window of time, under any interleaving of concurrent callers, the
+/// tokens granted never exceed the capacity plus what the configured rate
+/// accrues over that window. The only slack is the bucket's resolution: a token
+/// may be granted a few nanoseconds before it is exactly due (or up to 2^-28 of
+/// a token early, for a bucket whose time to fill exceeds ~36 years). A stale
+/// or non-monotonic clock reading can only cause a denial, never an extra
+/// grant. [`reset`](Self::reset) and [`refund`](Self::refund) deliberately add
+/// tokens and are outside that bound; tokens taken by
+/// [`reserve`](Self::reserve) count at the end of their returned wait.
 ///
 /// # Limits
 ///
-/// The packed representation caps capacity at about 4.29 million tokens
-/// (`u32::MAX` millitokens). Time is tracked as 32-bit milliseconds since
-/// construction and wraps every ~49.7 days; the wrap is handled, so an
-/// actively-used bucket refills correctly indefinitely (only a bucket idle for
-/// longer than that may under-refill once, safely, on its next use).
+/// Capacity is exact for every `u32`, and grants are exact for every rate up to
+/// ~4.3 × 10^9 tokens/second (faster buckets round each grant up to a
+/// multi-token unit). Time is tracked in nanoseconds since construction and
+/// never wraps; the clock range is at least ~438 years (~100 years at 10^9
+/// tokens/second and above), after which the clock is frozen: the bucket grants
+/// at most what it still holds and then denies. `retry_after` and [`time_until`](Self::time_until)
+/// are rounded up to the millisecond. A plain token bucket has no queue, so a
+/// large request can be starved by a stream of small ones; use
+/// [`reserve`](Self::reserve) where that matters.
+///
+/// A `Bucket<SystemClock>` is exactly one 64-byte cache line (without the
+/// `metrics` feature), so independent buckets never falsely share.
 ///
 /// # Examples
 ///
@@ -105,54 +94,12 @@ fn tier1_config(capacity: u32, amount: u32, period: Duration, initial: u32) -> B
 /// ```
 #[repr(align(64))]
 pub struct Bucket<C: Clock = SystemClock> {
-    /// Packed `(millitokens << 32) | last_ms`. The only mutable state, and the
-    /// single point of synchronisation.
-    state: AtomicU64,
-    /// Capacity in millitokens, already clamped to the 32-bit packing ceiling.
-    capacity_millitokens: u64,
-    /// Refill rate as millitokens-per-millisecond in `Q(REFILL_FRAC_BITS)` fixed
-    /// point. Derived once from `refill_amount` and the period in nanoseconds, so
-    /// the hot path needs only a multiply and a shift and sub-millisecond periods
-    /// stay accurate. Zero means no refill.
-    refill_per_ms_q: u128,
-    /// The monotonic anchor that `last_ms` is measured from.
+    /// The accounting engine: the packed state, the rate, and the config.
+    core: Core,
+    /// The monotonic anchor elapsed time is measured from.
     created_at: Monotonic,
-    /// The original configuration, kept for [`config`](Self::config).
-    config: BucketConfig,
     /// The injected time source.
     clock: C,
-}
-
-/// Constructs a bucket from a finished config and a clock, anchoring the refill
-/// clock at the supplied clock's current reading and filling to `initial`.
-fn build<C: Clock>(config: BucketConfig, clock: C) -> Bucket<C> {
-    let created_at = clock.now();
-    let capacity_millitokens = u64::from(config.capacity())
-        .saturating_mul(MILLI)
-        .min(u64::from(u32::MAX));
-    // Millitokens per millisecond = refill_amount * 1000 / period_ms
-    //                             = refill_amount * 1e9 / period_nanos,
-    // kept in Q(REFILL_FRAC_BITS) fixed point. Computing from nanoseconds keeps
-    // sub-millisecond periods accurate; the one division happens here, not on the
-    // acquire path. `0` disables refill.
-    let refill_per_ms_q = if config.refill_amount() == 0 || config.refill_period().is_zero() {
-        0
-    } else {
-        let period_nanos = u64::try_from(config.refill_period().as_nanos())
-            .unwrap_or(u64::MAX)
-            .max(1);
-        let numerator = (u128::from(config.refill_amount()) * 1_000_000_000) << REFILL_FRAC_BITS;
-        numerator / u128::from(period_nanos)
-    };
-    let initial_millitokens = (u64::from(config.initial()) * MILLI).min(capacity_millitokens);
-    Bucket {
-        state: AtomicU64::new(pack(initial_millitokens, 0)),
-        capacity_millitokens,
-        refill_per_ms_q,
-        created_at,
-        config,
-        clock,
-    }
 }
 
 impl Bucket<SystemClock> {
@@ -220,16 +167,55 @@ impl Bucket<SystemClock> {
     /// ```
     #[must_use]
     pub fn from_config(config: BucketConfig) -> Self {
-        build(config, SystemClock::new())
+        Self::with_config_and_clock(config, SystemClock::new())
     }
 }
 
 impl<C: Clock> Bucket<C> {
+    /// Creates a bucket from a [`BucketConfig`] and a clock in one step,
+    /// holding its initial tokens as of the clock's current reading.
+    ///
+    /// This is the clock-injection constructor: it reads the clock once and
+    /// builds once, where `from_config(config).with_clock(clock)` builds a
+    /// `SystemClock` bucket first and then rebuilds it. Use it wherever a
+    /// consumer creates buckets with an injected clock (per-key buckets in a
+    /// rate limiter, tests).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::{Bucket, BucketConfig};
+    /// use clock_lib::ManualClock;
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// let clock = Arc::new(ManualClock::new());
+    /// let config = BucketConfig::new(100, 10, Duration::from_secs(1), 0)?;
+    /// let bucket = Bucket::with_config_and_clock(config, Arc::clone(&clock));
+    ///
+    /// assert_eq!(bucket.available(), 0);
+    /// clock.advance(Duration::from_secs(1));
+    /// assert_eq!(bucket.available(), 10);
+    /// # Ok::<(), better_bucket::BucketError>(())
+    /// ```
+    #[must_use]
+    pub fn with_config_and_clock(config: BucketConfig, clock: C) -> Self {
+        let created_at = clock.now();
+        Self {
+            core: Core::new(config, Duration::ZERO),
+            created_at,
+            clock,
+        }
+    }
+
     /// Replaces the bucket's time source, resetting it to its initial fill
     /// anchored at the new clock's current reading.
     ///
-    /// This is the clock-injection seam. The intended use is immediately after
-    /// construction — chiefly in tests, where injecting a
+    /// Tokens already taken from `self` are forgotten: the result is a fresh
+    /// bucket with the same configuration. Prefer
+    /// [`with_config_and_clock`](Self::with_config_and_clock) when building
+    /// from scratch; this remains for chaining onto the Tier-1 constructors,
+    /// chiefly in tests, where injecting a
     /// [`ManualClock`](clock_lib::ManualClock) makes refill behaviour
     /// deterministic with no `sleep`.
     ///
@@ -252,17 +238,17 @@ impl<C: Clock> Bucket<C> {
     /// ```
     #[must_use]
     pub fn with_clock<C2: Clock>(self, clock: C2) -> Bucket<C2> {
-        build(self.config, clock)
+        Bucket::with_config_and_clock(self.core.config(), clock)
     }
 
     /// Attempts to take `n` tokens, returning the full [`Decision`].
     ///
     /// Brings the bucket current (lazy refill) and, if at least `n` tokens are
     /// available, deducts them and returns [`Decision::Allowed`]. Otherwise the
-    /// bucket is left untouched and [`Decision::Denied`] carries the minimum
-    /// wait until the request would succeed. Requesting `0` always succeeds;
-    /// requesting more than the capacity can never succeed (the denial's
-    /// `retry_after` is [`Duration::MAX`]).
+    /// bucket is left untouched and [`Decision::Denied`] carries the wait,
+    /// rounded up to the millisecond, until the request would succeed.
+    /// Requesting `0` always succeeds; requesting more than the capacity can
+    /// never succeed (the denial's `retry_after` is [`Duration::MAX`]).
     ///
     /// This never blocks and never allocates.
     ///
@@ -277,7 +263,35 @@ impl<C: Clock> Bucket<C> {
     /// ```
     #[inline]
     pub fn acquire(&self, n: u32) -> Decision {
-        self.acquire_inner(n)
+        self.core.acquire(n, self.elapsed())
+    }
+
+    /// [`acquire`](Self::acquire) at a caller-supplied clock reading.
+    ///
+    /// `now` should come from this bucket's clock (or one that agrees with it).
+    /// A reading earlier than the bucket's construction counts as the
+    /// construction instant; a reading earlier than the last grant simply sees
+    /// fewer tokens. Use it to read the clock once and decide for several
+    /// buckets, or to make a decision at a known instant.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::{Bucket, Decision};
+    /// use clock_lib::{Clock, ManualClock};
+    /// use std::sync::Arc;
+    ///
+    /// let clock = Arc::new(ManualClock::new());
+    /// let a = Bucket::per_second(1).with_clock(Arc::clone(&clock));
+    /// let b = Bucket::per_second(1).with_clock(Arc::clone(&clock));
+    ///
+    /// let now = clock.now(); // one read, two decisions
+    /// assert_eq!(a.acquire_at(1, now), Decision::Allowed);
+    /// assert_eq!(b.acquire_at(1, now), Decision::Allowed);
+    /// ```
+    #[inline]
+    pub fn acquire_at(&self, n: u32, now: Monotonic) -> Decision {
+        self.core.acquire(n, self.elapsed_at(now))
     }
 
     /// Attempts to take `n` tokens, returning whether it succeeded.
@@ -298,7 +312,65 @@ impl<C: Clock> Bucket<C> {
     #[inline]
     #[must_use]
     pub fn try_acquire(&self, n: u32) -> bool {
-        self.acquire_inner(n).is_allowed()
+        self.acquire(n).is_allowed()
+    }
+
+    /// [`try_acquire`](Self::try_acquire) at a caller-supplied clock reading;
+    /// see [`acquire_at`](Self::acquire_at).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::Bucket;
+    /// use clock_lib::{Clock, SystemClock};
+    ///
+    /// let bucket = Bucket::per_second(2);
+    /// let now = SystemClock::new().now();
+    /// assert!(bucket.try_acquire_at(2, now));
+    /// assert!(!bucket.try_acquire_at(1, now));
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn try_acquire_at(&self, n: u32, now: Monotonic) -> bool {
+        self.acquire_at(n, now).is_allowed()
+    }
+
+    /// Takes as many of `n` tokens as are available right now (possibly zero)
+    /// and returns how many it took.
+    ///
+    /// The partial-grant form, for byte-oriented throttling: write what the
+    /// budget allows now, the rest later. Never takes more than the capacity.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::Bucket;
+    ///
+    /// let bucket = Bucket::per_second(1_000);
+    /// assert_eq!(bucket.acquire_up_to(600), 600);
+    /// assert!(bucket.acquire_up_to(600) <= 401); // only what is left
+    /// ```
+    #[must_use = "the returned count is how many tokens were actually taken"]
+    pub fn acquire_up_to(&self, n: u32) -> u32 {
+        self.core.acquire_up_to(n, self.elapsed())
+    }
+
+    /// [`acquire_up_to`](Self::acquire_up_to) at a caller-supplied clock
+    /// reading; see [`acquire_at`](Self::acquire_at).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::Bucket;
+    /// use clock_lib::{Clock, SystemClock};
+    ///
+    /// let bucket = Bucket::per_second(10);
+    /// let now = SystemClock::new().now();
+    /// assert_eq!(bucket.acquire_up_to_at(25, now), 10);
+    /// ```
+    #[must_use = "the returned count is how many tokens were actually taken"]
+    pub fn acquire_up_to_at(&self, n: u32, now: Monotonic) -> u32 {
+        self.core.acquire_up_to(n, self.elapsed_at(now))
     }
 
     /// Returns how many whole tokens are available right now, after lazy refill.
@@ -319,13 +391,157 @@ impl<C: Clock> Bucket<C> {
     #[inline]
     #[must_use]
     pub fn available(&self) -> u32 {
-        let now_ms = self.now_ms();
-        let (tokens_mt, last_ms) = unpack(self.state.load(Ordering::Relaxed));
-        let refilled = self.refilled(tokens_mt, last_ms, now_ms);
-        u32::try_from(refilled / MILLI).unwrap_or(u32::MAX)
+        self.core.available(self.elapsed())
+    }
+
+    /// [`available`](Self::available) at a caller-supplied clock reading; see
+    /// [`acquire_at`](Self::acquire_at).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::Bucket;
+    /// use clock_lib::{Clock, ManualClock};
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// let clock = Arc::new(ManualClock::new());
+    /// let bucket = Bucket::per_second(10).with_clock(Arc::clone(&clock));
+    /// assert!(bucket.try_acquire(10));
+    /// clock.advance(Duration::from_millis(300));
+    /// assert_eq!(bucket.available_at(clock.now()), 3);
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn available_at(&self, now: Monotonic) -> u32 {
+        self.core.available(self.elapsed_at(now))
+    }
+
+    /// Returns how long until `n` tokens could be acquired, without taking any.
+    ///
+    /// `Some(Duration::ZERO)` means they are available now. `Some(wait)` is the
+    /// same honest, millisecond-rounded-up hint a denial would carry — exactly
+    /// what a `Retry-After` header needs, without spending a token to learn it.
+    /// `None` means the request can never succeed (`n` exceeds the capacity).
+    ///
+    /// Like [`available`](Self::available), this is a snapshot.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::Bucket;
+    /// use clock_lib::ManualClock;
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// let clock = Arc::new(ManualClock::new());
+    /// let bucket = Bucket::per_second(10).with_clock(Arc::clone(&clock));
+    /// assert_eq!(bucket.time_until(10), Some(Duration::ZERO));
+    /// assert!(bucket.try_acquire(10));
+    /// assert_eq!(bucket.time_until(5), Some(Duration::from_millis(500)));
+    /// assert_eq!(bucket.time_until(11), None);
+    /// ```
+    #[must_use]
+    pub fn time_until(&self, n: u32) -> Option<Duration> {
+        self.core.time_until(n, self.elapsed())
+    }
+
+    /// [`time_until`](Self::time_until) at a caller-supplied clock reading;
+    /// see [`acquire_at`](Self::acquire_at).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::Bucket;
+    /// use clock_lib::{Clock, SystemClock};
+    /// use std::time::Duration;
+    ///
+    /// let bucket = Bucket::per_second(4);
+    /// let now = SystemClock::new().now();
+    /// assert_eq!(bucket.time_until_at(4, now), Some(Duration::ZERO));
+    /// ```
+    #[must_use]
+    pub fn time_until_at(&self, n: u32, now: Monotonic) -> Option<Duration> {
+        self.core.time_until(n, self.elapsed_at(now))
+    }
+
+    /// Reserves `n` tokens now, even if they have not accrued yet, as long as
+    /// the wait until they are covered is at most `max_wait`.
+    ///
+    /// On success the tokens are taken immediately and the returned duration is
+    /// how long to wait before acting on them (zero if they were already
+    /// there). Later callers queue behind the reservation, so a large request
+    /// cannot be starved by a stream of small ones. Returns `None`, reserving
+    /// nothing, if `n` exceeds the capacity or the wait would exceed
+    /// `max_wait`. The bucket never sleeps on your behalf; pass the wait to
+    /// `std::thread::sleep` or an async timer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::Bucket;
+    /// use clock_lib::ManualClock;
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// let clock = Arc::new(ManualClock::new());
+    /// let bucket = Bucket::per_second(10).with_clock(Arc::clone(&clock));
+    /// assert!(bucket.try_acquire(10)); // empty
+    ///
+    /// let wait = bucket.reserve(5, Duration::from_secs(1));
+    /// assert_eq!(wait, Some(Duration::from_millis(500)));
+    /// // Too long a wait: nothing reserved.
+    /// assert_eq!(bucket.reserve(10, Duration::from_secs(1)), None);
+    /// ```
+    #[must_use = "the returned wait must be honoured before using the tokens"]
+    pub fn reserve(&self, n: u32, max_wait: Duration) -> Option<Duration> {
+        self.core.reserve(n, max_wait, self.elapsed())
+    }
+
+    /// [`reserve`](Self::reserve) at a caller-supplied clock reading; see
+    /// [`acquire_at`](Self::acquire_at).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::Bucket;
+    /// use clock_lib::{Clock, SystemClock};
+    /// use std::time::Duration;
+    ///
+    /// let bucket = Bucket::per_second(3);
+    /// let now = SystemClock::new().now();
+    /// assert_eq!(bucket.reserve_at(3, Duration::ZERO, now), Some(Duration::ZERO));
+    /// ```
+    #[must_use = "the returned wait must be honoured before using the tokens"]
+    pub fn reserve_at(&self, n: u32, max_wait: Duration, now: Monotonic) -> Option<Duration> {
+        self.core.reserve(n, max_wait, self.elapsed_at(now))
+    }
+
+    /// Returns `n` previously acquired tokens to the bucket.
+    ///
+    /// For work that acquired tokens and was then cancelled or failed before it
+    /// used the budget. The balance never exceeds the capacity, and a refund
+    /// also pays down an outstanding [`reserve`](Self::reserve). Refunding
+    /// tokens that were never acquired lets the bucket grant beyond its rate;
+    /// only refund what you took.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::Bucket;
+    ///
+    /// let bucket = Bucket::per_second(10);
+    /// assert!(bucket.try_acquire(10));
+    /// bucket.refund(4); // the request for 4 of them failed upstream
+    /// assert!(bucket.available() >= 4);
+    /// ```
+    pub fn refund(&self, n: u32) {
+        self.core.refund(n);
     }
 
     /// Returns the bucket's capacity (its burst ceiling), in whole tokens.
+    ///
+    /// Always equal to `self.config().capacity()`.
     ///
     /// # Examples
     ///
@@ -333,10 +549,11 @@ impl<C: Clock> Bucket<C> {
     /// use better_bucket::Bucket;
     ///
     /// assert_eq!(Bucket::per_second(64).capacity(), 64);
+    /// assert_eq!(Bucket::per_second(10_000_000).capacity(), 10_000_000);
     /// ```
     #[must_use]
     pub const fn capacity(&self) -> u32 {
-        (self.capacity_millitokens / MILLI) as u32
+        self.core.capacity()
     }
 
     /// Returns the configuration this bucket was built from.
@@ -352,15 +569,35 @@ impl<C: Clock> Bucket<C> {
     /// ```
     #[must_use]
     pub const fn config(&self) -> BucketConfig {
-        self.config
+        self.core.config()
+    }
+
+    /// Returns the bucket's clock.
+    ///
+    /// Handy for reading the time once and passing it to the `*_at` methods of
+    /// this and other buckets that share the clock.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::Bucket;
+    /// use clock_lib::Clock;
+    ///
+    /// let bucket = Bucket::per_second(5);
+    /// let now = bucket.clock().now();
+    /// assert!(bucket.try_acquire_at(1, now));
+    /// ```
+    #[must_use]
+    pub const fn clock(&self) -> &C {
+        &self.clock
     }
 
     /// Refills the bucket to full and marks it current as of now.
     ///
-    /// Use it to discard accumulated debt and grant a fresh burst — for example
-    /// at the start of a new billing window, or to clear a backlog after a
-    /// dependency recovers. Long uptime needs no special handling: the
-    /// millisecond counter wraps safely, so an actively-used bucket never stalls.
+    /// Use it to discard accumulated debt (including outstanding reservations)
+    /// and grant a fresh burst — for example at the start of a new billing
+    /// window, or to clear a backlog after a dependency recovers. Long uptime
+    /// needs no special handling: the clock never wraps.
     ///
     /// # Examples
     ///
@@ -374,113 +611,70 @@ impl<C: Clock> Bucket<C> {
     /// assert_eq!(bucket.available(), 4);
     /// ```
     pub fn reset(&self) {
-        let now_ms = self.now_ms();
-        self.state
-            .store(pack(self.capacity_millitokens, now_ms), Ordering::Relaxed);
+        self.core.reset(self.elapsed());
     }
 
-    /// Milliseconds since `created_at`, truncated into the 32-bit time field.
+    /// [`reset`](Self::reset) at a caller-supplied clock reading; see
+    /// [`acquire_at`](Self::acquire_at).
     ///
-    /// The field wraps every ~49.7 days. [`refilled`](Self::refilled) computes
-    /// the elapsed interval with `wrapping_sub`, so the result is correct for
-    /// any gap shorter than that — i.e. for any bucket used at least once per
-    /// ~49.7 days, which covers every real limiter. A bucket left fully idle for
-    /// longer may under-refill once on its next use (safe and self-correcting).
-    #[inline]
-    fn now_ms(&self) -> u32 {
-        let elapsed = self.clock.now().saturating_duration_since(self.created_at);
-        (elapsed.as_millis() & u128::from(u32::MAX)) as u32
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::Bucket;
+    /// use clock_lib::Clock;
+    ///
+    /// let bucket = Bucket::per_second(4);
+    /// assert!(bucket.try_acquire(4));
+    /// let now = bucket.clock().now();
+    /// bucket.reset_at(now);
+    /// assert_eq!(bucket.available_at(now), 4);
+    /// ```
+    pub fn reset_at(&self, now: Monotonic) {
+        self.core.reset(self.elapsed_at(now));
     }
 
-    /// The millitoken count after refilling over `last_ms → now_ms`, capped at
-    /// capacity. Saturating throughout: a huge elapsed gap fills to capacity, it
-    /// can never wrap or overflow. When no whole millisecond has elapsed since
-    /// the last refill — the common case under bursty load — it returns
-    /// immediately, doing no arithmetic at all.
-    #[inline]
-    fn refilled(&self, tokens_mt: u64, last_ms: u32, now_ms: u32) -> u64 {
-        if self.refill_per_ms_q == 0 {
-            return tokens_mt;
-        }
-        // `wrapping_sub` is correct because the 32-bit ms field wraps: the true
-        // elapsed interval is recovered for any gap shorter than ~49.7 days.
-        let elapsed_ms = now_ms.wrapping_sub(last_ms);
-        if elapsed_ms == 0 {
-            return tokens_mt;
-        }
-        let added = u128::from(elapsed_ms).saturating_mul(self.refill_per_ms_q) >> REFILL_FRAC_BITS;
-        let added_mt = u64::try_from(added).unwrap_or(u64::MAX);
-        tokens_mt
-            .saturating_add(added_mt)
-            .min(self.capacity_millitokens)
+    /// Returns a snapshot of the bucket's decision counters.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::Bucket;
+    ///
+    /// let bucket = Bucket::per_second(1);
+    /// let _ = bucket.try_acquire(1);
+    /// let _ = bucket.try_acquire(1);
+    /// let metrics = bucket.metrics();
+    /// assert_eq!(metrics.allowed + metrics.denied, 2);
+    /// ```
+    #[cfg(feature = "metrics")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
+    #[must_use]
+    pub fn metrics(&self) -> BucketMetrics {
+        self.core.metrics()
     }
 
-    /// The minimum time for `deficit_mt` millitokens to accrue, rounded up.
-    /// [`Duration::MAX`] if the bucket never refills.
-    fn time_for(&self, deficit_mt: u64) -> Duration {
-        if self.refill_per_ms_q == 0 {
-            return Duration::MAX;
-        }
-        // ms = ceil(deficit_mt / rate_per_ms) = ceil((deficit_mt << FRAC) / q).
-        let numerator =
-            (u128::from(deficit_mt) << REFILL_FRAC_BITS).saturating_add(self.refill_per_ms_q - 1);
-        let millis = numerator / self.refill_per_ms_q;
-        Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX))
+    /// Elapsed time since construction, from the bucket's own clock.
+    #[inline]
+    fn elapsed(&self) -> Duration {
+        self.elapsed_at(self.clock.now())
     }
 
+    /// Elapsed time since construction at a supplied reading. A reading from
+    /// before construction saturates to zero.
     #[inline]
-    fn acquire_inner(&self, n: u32) -> Decision {
-        if n == 0 {
-            // Zero tokens are always available, even from an empty bucket.
-            return Decision::Allowed;
-        }
-        let need_mt = u64::from(n) * MILLI;
-        if need_mt > self.capacity_millitokens {
-            // More than the bucket can ever hold: it can never be granted.
-            return Decision::Denied {
-                retry_after: Duration::MAX,
-            };
-        }
-
-        let now_ms = self.now_ms();
-        loop {
-            let current = self.state.load(Ordering::Relaxed);
-            let (tokens_mt, last_ms) = unpack(current);
-            let refilled = self.refilled(tokens_mt, last_ms, now_ms);
-            if refilled < need_mt {
-                // Denied: report the wait for the shortfall to accrue. No write,
-                // so a denied request never contends with a granting one.
-                return Decision::Denied {
-                    retry_after: self.time_for(need_mt - refilled),
-                };
-            }
-            let next = pack(refilled - need_mt, now_ms);
-            // Relaxed is sufficient: the only shared state is this word, and the
-            // CAS gives the read-modify-write atomicity the no-over-grant
-            // contract depends on. A spurious or lost race retries.
-            match self.state.compare_exchange_weak(
-                current,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Decision::Allowed,
-                // Lost the race (or a spurious weak failure). Hint the CPU that
-                // we are in a retry spin before recomputing — this eases the
-                // cache-line contention and yields to a sibling SMT thread, and
-                // costs nothing on the uncontended path, which never gets here.
-                Err(_) => core::hint::spin_loop(),
-            }
-        }
+    fn elapsed_at(&self, now: Monotonic) -> Duration {
+        now.saturating_duration_since(self.created_at)
     }
 }
 
+/// Shows the capacity, the configuration, and the tokens available at the time
+/// of formatting (which reads the clock).
 impl<C: Clock> core::fmt::Debug for Bucket<C> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Bucket")
             .field("capacity", &self.capacity())
             .field("available", &self.available())
-            .field("config", &self.config)
+            .field("config", &self.config())
             .finish()
     }
 }
@@ -490,7 +684,12 @@ impl<C: Clock> core::fmt::Debug for Bucket<C> {
 /// `TokenBucket` is the abstraction `rate-net` (and any other consumer) codes
 /// against, so it can hold a bucket without naming its concrete clock type. It
 /// mirrors the inherent methods of [`Bucket`]; see those for the detailed
-/// contract of each.
+/// contract of each. The trait is object-safe.
+///
+/// [`time_until`](Self::time_until) and [`reset`](Self::reset) were added in
+/// 1.1 with provided bodies, so existing implementations keep compiling.
+/// [`Bucket`] overrides both with the real behaviour; another implementation
+/// should too.
 pub trait TokenBucket {
     /// Attempts to take `n` tokens, returning the full [`Decision`].
     fn acquire(&self, n: u32) -> Decision;
@@ -506,27 +705,91 @@ pub trait TokenBucket {
     /// Returns the bucket's capacity (its burst ceiling).
     #[must_use]
     fn capacity(&self) -> u32;
+
+    /// Returns how long until `n` tokens could be acquired, without taking any;
+    /// see [`Bucket::time_until`].
+    ///
+    /// The answer means the same for every implementation: `None` is "this
+    /// request can never succeed", and `Some(wait)` is an upper bound on the
+    /// wait — `Some(Duration::ZERO)` when it would succeed now.
+    ///
+    /// The provided body cannot see a refill rate, so it answers only what
+    /// [`available`](Self::available) and [`capacity`](Self::capacity) can:
+    /// `Some(Duration::ZERO)` when `n` tokens are there now, `None` when `n`
+    /// exceeds the capacity, and otherwise `Some(Duration::MAX)` — "not now,
+    /// and no better bound is known". [`Bucket`] overrides it with the exact
+    /// wait, and never returns `Some(Duration::MAX)`; another implementation
+    /// should override it too.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::{Bucket, TokenBucket};
+    /// use std::time::Duration;
+    ///
+    /// let bucket: &dyn TokenBucket = &Bucket::per_second(2);
+    /// assert_eq!(bucket.time_until(2), Some(Duration::ZERO));
+    /// assert_eq!(bucket.time_until(3), None); // above capacity: never
+    /// ```
+    #[must_use]
+    fn time_until(&self, n: u32) -> Option<Duration> {
+        if n == 0 || self.available() >= n {
+            Some(Duration::ZERO)
+        } else if n > self.capacity() {
+            None
+        } else {
+            Some(Duration::MAX)
+        }
+    }
+
+    /// Refills the bucket to full; see [`Bucket::reset`].
+    ///
+    /// The provided body does nothing, for implementations with no notion of a
+    /// refill. [`Bucket`] overrides it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::{Bucket, TokenBucket};
+    ///
+    /// let bucket = Bucket::per_second(3);
+    /// let limiter: &dyn TokenBucket = &bucket;
+    /// assert!(limiter.try_acquire(3));
+    /// limiter.reset();
+    /// assert_eq!(limiter.available(), 3);
+    /// ```
+    fn reset(&self) {}
 }
 
 impl<C: Clock> TokenBucket for Bucket<C> {
     #[inline]
     fn acquire(&self, n: u32) -> Decision {
-        self.acquire_inner(n)
+        Self::acquire(self, n)
     }
 
     #[inline]
     fn try_acquire(&self, n: u32) -> bool {
-        self.acquire_inner(n).is_allowed()
+        Self::try_acquire(self, n)
     }
 
     #[inline]
     fn available(&self) -> u32 {
-        Bucket::available(self)
+        Self::available(self)
     }
 
     #[inline]
     fn capacity(&self) -> u32 {
-        self.capacity()
+        Self::capacity(self)
+    }
+
+    #[inline]
+    fn time_until(&self, n: u32) -> Option<Duration> {
+        Self::time_until(self, n)
+    }
+
+    #[inline]
+    fn reset(&self) {
+        Self::reset(self);
     }
 }
 
@@ -535,8 +798,9 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::{Bucket, TokenBucket};
+    use crate::config::BucketConfig;
     use crate::decision::Decision;
-    use clock_lib::{ManualClock, SystemClock};
+    use clock_lib::{Clock, ManualClock, SystemClock};
     use core::time::Duration;
     use std::sync::Arc;
     use std::thread;
@@ -625,7 +889,8 @@ mod tests {
 
     #[test]
     fn test_refill_after_long_idle_saturates_without_overflow() {
-        // A multi-year idle gap must fill to capacity, never wrap or overflow.
+        // A multi-year idle gap fills to capacity — for any length, not only
+        // when the gap happens to land well modulo 2^32 ms.
         let (clock, bucket) = manual_bucket(1_000);
         assert!(bucket.try_acquire(1_000));
         clock.advance(Duration::from_secs(60 * 60 * 24 * 365 * 5));
@@ -659,8 +924,8 @@ mod tests {
 
     #[test]
     fn test_sub_millisecond_period_still_refills() {
-        // 5 tokens per 200µs ⇒ 25 tokens/ms. The millisecond tick is coarse but
-        // the rate is computed from nanoseconds, so a full ms refills fully.
+        // 5 tokens per 200µs ⇒ 25 tokens/ms: a full millisecond refills the
+        // bucket to capacity.
         let clock = Arc::new(ManualClock::new());
         let bucket =
             Bucket::per_duration(5, Duration::from_micros(200)).with_clock(Arc::clone(&clock));
@@ -770,13 +1035,148 @@ mod tests {
     }
 
     #[test]
-    fn test_pack_unpack_round_trip() {
-        for &mt in &[0_u64, 1, 1_000, 50_000, u64::from(u32::MAX)] {
-            for &ms in &[0_u32, 1, 1_000, u32::MAX] {
-                let (got_mt, got_ms) = super::unpack(super::pack(mt, ms));
-                assert_eq!(got_mt, mt.min(u64::from(u32::MAX)));
-                assert_eq!(got_ms, ms);
-            }
-        }
+    fn test_system_clock_bucket_is_one_cache_line() {
+        assert_eq!(core::mem::align_of::<Bucket<SystemClock>>(), 64);
+        #[cfg(all(not(feature = "metrics"), target_pointer_width = "64"))]
+        assert_eq!(core::mem::size_of::<Bucket<SystemClock>>(), 64);
+    }
+
+    #[test]
+    fn test_with_config_and_clock_builds_once_at_the_clock_reading() {
+        let clock = Arc::new(ManualClock::new());
+        clock.advance(Duration::from_secs(3_600)); // the clock is not at zero
+        let config = BucketConfig::new(10, 10, Duration::from_secs(1), 0).unwrap();
+        let bucket = Bucket::with_config_and_clock(config, Arc::clone(&clock));
+        assert_eq!(bucket.available(), 0);
+        assert_eq!(bucket.config(), config);
+        clock.advance(Duration::from_millis(700));
+        assert_eq!(bucket.available(), 7);
+    }
+
+    #[test]
+    fn test_with_clock_on_a_used_bucket_starts_fresh() {
+        let (_clock, bucket) = manual_bucket(10);
+        assert!(bucket.try_acquire(10));
+        let rebuilt = bucket.with_clock(Arc::new(ManualClock::new()));
+        assert_eq!(rebuilt.available(), 10);
+    }
+
+    #[test]
+    fn test_at_methods_use_the_supplied_reading() {
+        let (clock, bucket) = manual_bucket(10);
+        let start = clock.now();
+        assert!(bucket.try_acquire_at(10, start));
+        clock.advance(Duration::from_millis(500));
+        let later = clock.now();
+        assert_eq!(bucket.available_at(start), 0);
+        assert_eq!(bucket.available_at(later), 5);
+        assert_eq!(
+            bucket.time_until_at(5, start),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(bucket.time_until_at(5, later), Some(Duration::ZERO));
+        assert_eq!(bucket.acquire_at(5, later), Decision::Allowed);
+        assert_eq!(bucket.acquire_up_to_at(5, later), 0);
+        assert_eq!(
+            bucket.reserve_at(1, Duration::from_secs(1), later),
+            Some(Duration::from_millis(100))
+        );
+        bucket.reset_at(later);
+        assert_eq!(bucket.available_at(later), 10);
+    }
+
+    #[test]
+    fn test_reading_before_construction_is_clamped() {
+        let clock = Arc::new(ManualClock::new());
+        let before = clock.now();
+        clock.advance(Duration::from_secs(1));
+        let config = BucketConfig::new(4, 4, Duration::from_secs(1), 1).unwrap();
+        let bucket = Bucket::with_config_and_clock(config, Arc::clone(&clock));
+        assert_eq!(bucket.available_at(before), 1);
+    }
+
+    #[test]
+    fn test_time_until_does_not_consume() {
+        let (_clock, bucket) = manual_bucket(10);
+        assert!(bucket.try_acquire(10));
+        assert_eq!(bucket.time_until(3), Some(Duration::from_millis(300)));
+        assert_eq!(bucket.time_until(3), Some(Duration::from_millis(300)));
+        assert_eq!(bucket.time_until(0), Some(Duration::ZERO));
+        assert_eq!(bucket.time_until(11), None);
+        assert_eq!(bucket.available(), 0);
+    }
+
+    #[test]
+    fn test_reserve_queues_large_requests_fairly() {
+        let (clock, bucket) = manual_bucket(10);
+        assert!(bucket.try_acquire(10));
+        // A full-capacity request reserves its place; small requests that come
+        // after it wait behind it instead of starving it.
+        assert_eq!(
+            bucket.reserve(10, Duration::from_secs(5)),
+            Some(Duration::from_secs(1))
+        );
+        clock.advance(Duration::from_millis(500));
+        assert!(!bucket.try_acquire(1));
+        clock.advance(Duration::from_millis(600));
+        assert!(bucket.try_acquire(1));
+        assert_eq!(bucket.reserve(10, Duration::from_millis(100)), None);
+    }
+
+    #[test]
+    fn test_acquire_up_to_and_refund() {
+        let (_clock, bucket) = manual_bucket(10);
+        assert_eq!(bucket.acquire_up_to(4), 4);
+        assert_eq!(bucket.acquire_up_to(100), 6);
+        assert_eq!(bucket.acquire_up_to(1), 0);
+        bucket.refund(7);
+        assert_eq!(bucket.available(), 7);
+        bucket.refund(100);
+        assert_eq!(bucket.available(), 10);
+    }
+
+    #[test]
+    fn test_clock_accessor_returns_the_injected_clock() {
+        let (clock, bucket) = manual_bucket(1);
+        clock.advance(Duration::from_secs(9));
+        assert_eq!(bucket.clock().offset(), Duration::from_secs(9));
+    }
+
+    #[test]
+    fn test_debug_shows_capacity_available_and_config() {
+        let (_clock, bucket) = manual_bucket(3);
+        assert!(bucket.try_acquire(1));
+        let rendered = std::format!("{bucket:?}");
+        assert!(rendered.starts_with("Bucket"));
+        assert!(rendered.contains("capacity: 3"));
+        assert!(rendered.contains("available: 2"));
+        assert!(rendered.contains("config: BucketConfig"));
+    }
+
+    #[test]
+    fn test_trait_forwards_time_until_and_reset() {
+        let (_clock, bucket) = manual_bucket(2);
+        let as_trait: &dyn TokenBucket = &bucket;
+        assert!(as_trait.try_acquire(2));
+        assert_eq!(
+            as_trait.acquire(1).retry_after(),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(as_trait.time_until(1), Some(Duration::from_millis(500)));
+        as_trait.reset();
+        assert_eq!(as_trait.available(), 2);
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn test_bucket_metrics_count_decisions() {
+        let (_clock, bucket) = manual_bucket(2);
+        assert!(bucket.try_acquire(2));
+        assert!(!bucket.try_acquire(1));
+        let metrics = bucket.metrics();
+        assert_eq!(
+            (metrics.allowed, metrics.denied, metrics.tokens_granted),
+            (1, 1, 2)
+        );
     }
 }

@@ -20,6 +20,18 @@ use crate::error::BucketError;
 /// `initial` is clamped to `capacity`: asking a bucket to start with more
 /// tokens than it can hold simply starts it full.
 ///
+/// Every capacity `new` accepts is held exactly — there is no ceiling below
+/// `u32::MAX`, so [`Bucket::capacity`](crate::Bucket::capacity) always equals
+/// [`capacity`](Self::capacity) — and no rate is too slow to refill on time.
+/// Rates above ~4.3 × 10^9 tokens/second (which need a sub-second period) are
+/// the one approximation: they round each grant up to a multi-token unit.
+///
+/// With the `serde` feature, `BucketConfig` implements `Serialize` and
+/// `Deserialize`. Deserialization runs the same validation as `new`, so a
+/// configuration file cannot smuggle in a zero capacity or period; unknown
+/// fields are rejected. `refill_period` uses serde's standard `Duration` form
+/// (`{ secs, nanos }`).
+///
 /// # Examples
 ///
 /// ```
@@ -32,7 +44,9 @@ use crate::error::BucketError;
 /// assert_eq!(config.initial(), 0);
 /// # Ok::<(), better_bucket::BucketError>(())
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "RawConfig"))]
 pub struct BucketConfig {
     capacity: u32,
     refill_amount: u32,
@@ -80,7 +94,21 @@ impl BucketConfig {
     /// assert_eq!(config.initial(), 100); // clamped to capacity
     /// # Ok::<(), better_bucket::BucketError>(())
     /// ```
-    pub fn new(
+    ///
+    /// `new` is a `const fn`, so a configuration can be validated at compile
+    /// time — handy for a `static` bucket on an embedded target:
+    ///
+    /// ```
+    /// use better_bucket::BucketConfig;
+    /// use std::time::Duration;
+    ///
+    /// const LIMIT: BucketConfig = match BucketConfig::new(10, 10, Duration::from_secs(1), 10) {
+    ///     Ok(config) => config,
+    ///     Err(_) => panic!("invalid bucket configuration"),
+    /// };
+    /// assert_eq!(LIMIT.capacity(), 10);
+    /// ```
+    pub const fn new(
         capacity: u32,
         refill_amount: u32,
         refill_period: Duration,
@@ -95,12 +123,7 @@ impl BucketConfig {
         if refill_period.is_zero() {
             return Err(BucketError::ZeroRefillPeriod);
         }
-        Ok(Self {
-            capacity,
-            refill_amount,
-            refill_period,
-            initial: initial.min(capacity),
-        })
+        Ok(Self::raw(capacity, refill_amount, refill_period, initial))
     }
 
     /// The maximum number of tokens the bucket holds (its burst ceiling).
@@ -131,18 +154,49 @@ impl BucketConfig {
     /// constructors. A degenerate request (zero capacity or zero refill) yields
     /// a bucket that grants nothing, which is well-defined and safe rather than
     /// a panic.
-    pub(crate) fn raw(
+    pub(crate) const fn raw(
         capacity: u32,
         refill_amount: u32,
         refill_period: Duration,
         initial: u32,
     ) -> Self {
+        let initial = if initial < capacity {
+            initial
+        } else {
+            capacity
+        };
         Self {
             capacity,
             refill_amount,
             refill_period,
-            initial: initial.min(capacity),
+            initial,
         }
+    }
+}
+
+/// The unvalidated wire form of a [`BucketConfig`]; deserialization goes
+/// through [`BucketConfig::new`] via `TryFrom`.
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConfig {
+    capacity: u32,
+    refill_amount: u32,
+    refill_period: Duration,
+    initial: u32,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<RawConfig> for BucketConfig {
+    type Error = BucketError;
+
+    fn try_from(raw: RawConfig) -> Result<Self, Self::Error> {
+        Self::new(
+            raw.capacity,
+            raw.refill_amount,
+            raw.refill_period,
+            raw.initial,
+        )
     }
 }
 

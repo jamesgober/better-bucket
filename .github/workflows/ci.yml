@@ -17,7 +17,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # ubuntu-24.04-arm covers aarch64 Linux; macos-latest is Apple Silicon.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
         rust: [stable, "1.85"]
     steps:
       - uses: actions/checkout@v5
@@ -26,22 +27,81 @@ jobs:
           toolchain: ${{ matrix.rust }}
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: Toolchain
+        run: rustc --version
       - name: Format
         run: cargo fmt --all -- --check
-      # Default features (std + clock) are the full functional surface. The
-      # `comparison` feature is benchmark-only — it pulls in `governor` and is
-      # intentionally excluded from CI; it is exercised manually via
-      # `cargo bench --features comparison`.
-      - name: Clippy
+      # The `comparison` feature is benchmark-only — it pulls in `governor` —
+      # so the runtime feature set is listed explicitly instead of
+      # `--all-features`. `--all-features` (governor included) is linted in the
+      # `features` job on stable.
+      - name: Clippy (default)
         run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (all runtime features)
+        run: cargo clippy --all-targets --features serde,metrics,portable-atomic -- -D warnings
+      - name: Clippy (no_std core)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
       - name: Test
         run: cargo test
-      - name: Test (no_std)
+      - name: Test (all runtime features)
+        run: cargo test --features serde,metrics
+      - name: Test (no default features)
         run: cargo test --no-default-features
       - name: Doc
-        run: cargo doc --no-deps
+        run: cargo doc --no-deps --features serde,metrics
         env:
           RUSTDOCFLAGS: "-D warnings"
+
+  features:
+    name: Feature combinations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (all features, including the comparison bench)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test (each feature alone)
+        run: |
+          for f in std clock forge serde metrics portable-atomic; do
+            echo "::group::$f"
+            cargo test --no-default-features --features "$f"
+            echo "::endgroup::"
+          done
+      - name: Benches build
+        run: cargo bench --no-run --all-features
+
+  no-std:
+    name: no_std (thumbv7em-none-eabihf)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+      # Cortex-M4 has no 64-bit atomics: the bare build exposes the config and
+      # decision types; `portable-atomic` brings in `BucketCore`.
+      - name: Build (bare no_std)
+        run: cargo build --no-default-features --target thumbv7em-none-eabihf
+      - name: Build (no_std + BucketCore via portable-atomic)
+        run: cargo build --no-default-features --features portable-atomic,serde,metrics --target thumbv7em-none-eabihf
+
+  bits32:
+    name: 32-bit (i686-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Install 32-bit libc
+        run: sudo apt-get update && sudo apt-get install -y gcc-multilib
+      - name: Test
+        run: cargo test --target i686-unknown-linux-gnu --features serde,metrics
 
   loom:
     name: Loom (concurrency model check)
@@ -50,10 +110,67 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # clock-lib 1.1.0 uses loom in library code under cfg(loom) without
+      # declaring it as a dependency, so pin the last release that builds.
+      - name: Pin clock-lib for loom
+        run: cargo update -p clock-lib --precise 1.0.0
       - name: Loom
-        run: cargo test --test loom_acquire
+        run: cargo test --release --test loom_acquire
         env:
           RUSTFLAGS: "--cfg loom"
+
+  miri:
+    name: Miri
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      # The real-clock contention suite and the long stress tests are skipped:
+      # under Miri they take tens of minutes and exercise no extra code.
+      - name: Miri
+        run: >-
+          cargo miri test --lib --test core_properties --test consumer_pattern --test hardening
+          -- --skip test_concurrent_acquire_and_reset_stay_in_bounds
+          --skip test_high_contention_conserves_every_token
+          --skip test_core_concurrent_mixed_operations_conserve_tokens
+        env:
+          PROPTEST_CASES: "8"
+          MIRIFLAGS: "-Zmiri-disable-isolation"
+      - name: Miri (portable-atomic path)
+        run: cargo miri test --lib --features portable-atomic,metrics -- --skip test_high_contention_conserves_every_token --skip test_core_concurrent_mixed_operations_conserve_tokens
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation"
+
+  asan:
+    name: AddressSanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      # `--target` keeps the sanitizer flags off build scripts and proc macros;
+      # `-Zbuild-std` instruments the standard library too. Doctests are not
+      # instrumented, so only the unit and integration tests run.
+      - name: ASan
+        run: >-
+          cargo test -Zbuild-std --target x86_64-unknown-linux-gnu
+          --features serde,metrics --lib --tests
+        env:
+          RUSTFLAGS: "-Zsanitizer=address"
+          RUSTDOCFLAGS: "-Zsanitizer=address"
+          ASAN_OPTIONS: "detect_leaks=1"
+
+  semver:
+    name: SemVer (cargo-semver-checks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
 
   security:
     name: Security (audit + deny)
@@ -66,6 +183,10 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit,cargo-deny
+      # Libraries do not commit Cargo.lock; resolve a fresh one so the audit
+      # sees the versions a new consumer would get.
+      - name: Resolve lockfile
+        run: cargo generate-lockfile
       - name: Audit
         run: cargo audit
       - name: Deny

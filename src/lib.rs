@@ -1,13 +1,14 @@
 //! # better-bucket
 //!
-//! A genuinely better token bucket for Rust. The hot path — `try_acquire` — is
-//! designed to be **lock-free**, **allocation-free**, and **cache-aligned**: a
-//! single compare-and-swap over a packed `(tokens, last_refill_tick)` word.
-//! Refill is **lazy**, computed from a monotonic clock the instant you ask, so
-//! an idle bucket costs nothing — no background timer thread, no per-tick
-//! wakeups. The defining correctness property is that the bucket **never
-//! over-grants**: across any concurrent interleaving, the total tokens handed
-//! out never exceed capacity plus accrued refill.
+//! A lock-free token bucket for Rust. The hot path — `try_acquire` — is
+//! **lock-free** (on every target with native 64-bit atomics),
+//! **allocation-free**, and **cache-aligned**: a single compare-and-swap on one
+//! atomic word. Refill is **lazy**, computed from a
+//! monotonic clock the instant you ask, so an idle bucket costs nothing — no
+//! background timer thread, no per-tick wakeups. The defining correctness
+//! property is that the bucket **never over-grants**: under any interleaving of
+//! concurrent callers, the tokens granted over any window never exceed the
+//! capacity plus what the configured rate accrues over that window.
 //!
 //! The crate is a single-purpose primitive. It owns token-bucket accounting and
 //! nothing else, so it can sit at the bottom of a dependency tree (its first
@@ -16,15 +17,24 @@
 //!
 //! ## Guarantees
 //!
-//! The safety contract holds under any concurrent interleaving, adversarial
-//! input, and extreme uptime: **no panic, no wrap, no over-grant, and tokens
-//! always within `[0, capacity]`.** It is defended by `loom` model checking, a
-//! multi-thread stress test, an allocation audit, an adversarial/edge suite, and
-//! `proptest`. `try_acquire` is a single `compare_exchange_weak` on a packed
-//! atomic word — allocation-free, cache-line aligned, with a division-free
-//! fixed-point refill. The bucket's own accounting measures a few nanoseconds;
-//! end-to-end `try_acquire` is bounded by the monotonic clock read (see
-//! `docs/BENCHMARKS.md`).
+//! **No panic, no wrap, no over-grant, and tokens always within
+//! `[0, capacity]`**, under any concurrent interleaving, adversarial input, and
+//! extreme uptime. The state is a single instant — when the bucket would have
+//! been empty — so a stale or backward clock reading can only make a decision
+//! more conservative; it can never manufacture a refill, and a reading past the
+//! end of the clock's range fails closed. Capacity is exact for every `u32`,
+//! time is tracked in nanoseconds and never wraps (at least ~438 years of range
+//! below 10^9 tokens/second, ~100 years above), and token amounts are exact for
+//! every rate up to ~4.3 × 10^9 tokens/second; the only slack is that a token
+//! may be granted a few nanoseconds before it is exactly due (or up to 2^-28 of
+//! a token early, for a bucket whose time to fill exceeds ~36 years).
+//!
+//! This is checked by `loom` model checking on the real bucket with an
+//! advancing clock, a real-clock multi-thread grant-ceiling test, property
+//! tests against an exact reference model, an allocation audit, and an
+//! adversarial/edge suite. The bucket's own accounting measures a few
+//! nanoseconds; end-to-end `try_acquire` is bounded by the monotonic clock read
+//! (see `docs/BENCHMARKS.md`).
 //!
 //! Token bucket is the crate's sole algorithm by design — leaky-bucket and
 //! sliding-window limiting live in the downstream `rate-net` crate.
@@ -44,36 +54,54 @@
 //! # }
 //! ```
 //!
-//! The bucket reads time from [`clock-lib`](https://crates.io/crates/clock-lib);
-//! the `clock` feature (on by default) provides it and implies `std`. The
-//! lock-free accounting core needs only `core`, but the shipped `Bucket`
-//! constructors read the clock, so a bare `no_std` build
-//! (`default-features = false`) exposes only [`VERSION`].
+//! ## Two front doors
+//!
+//! - [`Bucket`] reads time from an injected [`clock-lib`](https://crates.io/crates/clock-lib)
+//!   clock (the OS monotonic clock by default, a `ManualClock` in tests). It
+//!   needs the `clock` feature, which is on by default and implies `std`.
+//! - [`BucketCore`] is the same engine with the caller supplying the time as a
+//!   `Duration` since an epoch of its choosing. It needs only `core` and a
+//!   64-bit atomic, so it is the `no_std` path:
+//!
+//! ```
+//! use better_bucket::{BucketConfig, BucketCore};
+//! use core::time::Duration;
+//!
+//! let config = BucketConfig::new(10, 10, Duration::from_secs(1), 10)?;
+//! let bucket = BucketCore::new(config, Duration::ZERO);
+//! assert!(bucket.try_acquire_at(10, Duration::ZERO));
+//! assert_eq!(bucket.available_at(Duration::from_millis(500)), 5);
+//! # Ok::<(), better_bucket::BucketError>(())
+//! ```
 //!
 //! ## Design goals
 //!
-//! - **Lock-free acquire.** One `compare_exchange_weak` on a packed atomic
-//!   word; no `Mutex`, no parking on the hot path.
-//! - **Allocation-free steady state.** A bucket is a small, cache-line-aligned
-//!   value with no heap tail; acquiring never allocates.
+//! - **Lock-free acquire.** One `compare_exchange_weak` on one atomic word; no
+//!   `Mutex`, no parking on the hot path (on native 64-bit atomics).
+//! - **Allocation-free steady state.** A `Bucket<SystemClock>` is one 64-byte
+//!   cache line with no heap tail; acquiring never allocates.
 //! - **Lazy refill.** Tokens accrue from elapsed monotonic time on access — no
 //!   timer thread, no wakeups, no watts burned while idle.
-//! - **Overflow-safe.** Every refill and capacity computation is checked or
-//!   saturating; a hostile request count or a multi-day idle gap can neither
-//!   wrap the counter nor over-fill the bucket.
-//! - **`no_std`-capable.** The core runs without the standard library; the
-//!   caller drives time when `std` is disabled.
+//! - **Overflow-safe.** Every computation is checked, saturating, or widened; a
+//!   hostile request count, an idle gap of any length, or a stale clock reading
+//!   can neither wrap the state nor over-fill the bucket.
+//! - **`no_std`-capable.** [`BucketCore`], [`BucketConfig`], [`Decision`], and
+//!   [`BucketError`] need only `core`; the caller drives time.
 //!
 //! ## Feature flags
 //!
 //! | Feature | Default | Description |
 //! |---------|---------|-------------|
-//! | `std`   | yes     | Standard library. Off → `no_std`, caller drives time. |
-//! | `clock` | yes     | Pluggable [`clock-lib`](https://crates.io/crates/clock-lib) time source plus a mockable clock for deterministic tests. |
+//! | `std`   | yes     | Standard library. Off → `no_std`; [`BucketCore`] and the config/decision/error types remain. |
+//! | `clock` | yes     | [`Bucket`] and the [`clock-lib`](https://crates.io/crates/clock-lib) time source, plus a mockable clock for deterministic tests. Implies `std` and `forge`. |
+//! | `forge` | yes (via `clock`) | `error_forge::ForgeError` for [`BucketError`]. |
+//! | `serde` | no      | `Serialize` / validating `Deserialize` for [`BucketConfig`]. |
+//! | `metrics` | no    | Allowed / denied / granted-token counters on every bucket. Zero cost when off. |
+//! | `portable-atomic` | no | Use [`portable-atomic`](https://crates.io/crates/portable-atomic) for the state word, for targets without native 64-bit atomics (e.g. Cortex-M). There it is a global lock: not lock-free, and not interrupt-safe unless the binary enables portable-atomic's `unsafe-assume-single-core` or `critical-section` feature. |
 
-// `no_std` for the library build when `std` is off, but always link `std` under
-// `test` so the unit-test harness (and dev-dependencies) have what they need.
-#![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
+#![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![forbid(unsafe_code)]
 #![deny(warnings)]
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -88,31 +116,41 @@
 #![deny(clippy::dbg_macro)]
 #![deny(clippy::unreachable)]
 #![deny(clippy::undocumented_unsafe_blocks)]
+#![deny(clippy::missing_safety_doc)]
+// Without `clock`, links to `Bucket` and `TokenBucket` in shared docs have no
+// target; the items they describe are simply absent from that build.
+#![cfg_attr(not(feature = "clock"), allow(rustdoc::broken_intra_doc_links))]
 
-// The token-bucket surface requires a clock to read time and a `Mutex` for the
-// simple implementation; both are gated on `clock` (which implies `std`). The
-// no_std, caller-driven core arrives with the lock-free rewrite in 0.3.
+// The unit tests use `std` (threads, `Arc`, `format!`) even when the library
+// itself is built `no_std`.
+#[cfg(all(test, not(feature = "std")))]
+extern crate std;
+
 #[cfg(feature = "clock")]
 mod bucket;
-#[cfg(feature = "clock")]
 mod builder;
-#[cfg(feature = "clock")]
 mod config;
-#[cfg(feature = "clock")]
 mod decision;
-#[cfg(feature = "clock")]
+// The lock-free engine needs a 64-bit atomic: native where the target has one,
+// or `portable-atomic` where it does not.
+#[cfg(any(target_has_atomic = "64", feature = "portable-atomic"))]
+mod engine;
 mod error;
+#[cfg(feature = "metrics")]
+mod metrics;
 
 #[cfg(feature = "clock")]
+#[cfg_attr(docsrs, doc(cfg(feature = "clock")))]
 pub use crate::bucket::{Bucket, TokenBucket};
-#[cfg(feature = "clock")]
 pub use crate::builder::BucketBuilder;
-#[cfg(feature = "clock")]
 pub use crate::config::BucketConfig;
-#[cfg(feature = "clock")]
 pub use crate::decision::Decision;
-#[cfg(feature = "clock")]
+#[cfg(any(target_has_atomic = "64", feature = "portable-atomic"))]
+pub use crate::engine::BucketCore;
 pub use crate::error::BucketError;
+#[cfg(feature = "metrics")]
+#[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
+pub use crate::metrics::BucketMetrics;
 
 /// The version of this crate, taken from `Cargo.toml` at compile time.
 ///
@@ -130,9 +168,20 @@ pub use crate::error::BucketError;
 /// ```
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+// Compile and run the Rust examples in the README and the API reference as
+// doctests, so the documentation cannot drift from the code.
+#[cfg(all(doctest, feature = "clock"))]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
+#[cfg(all(doctest, feature = "clock", feature = "metrics"))]
+#[doc = include_str!("../docs/API.md")]
+struct ApiReferenceDoctests;
+
 #[cfg(test)]
 mod tests {
     use super::VERSION;
+    use std::vec::Vec;
 
     #[test]
     fn test_version_is_well_formed_semver() {

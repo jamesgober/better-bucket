@@ -12,13 +12,177 @@
 
 ## [Unreleased]
 
-### Added
+---
 
-### Changed
+## [1.1.0] — 2026-10-13
+
+A correctness release with additive features. **Upgrade from 1.0.0 is strongly
+recommended**: 1.0.0 over-granted by one to two orders of magnitude under
+ordinary multi-threaded use with the default clock. Every 1.0 call site compiles
+and keeps its meaning; the fix is inside the existing methods.
+
+### Security
+
+- **Rate-limit bypass under concurrency (BB-SEC-01).** With the default
+  `SystemClock` and two or more threads, 1.0.0 admitted 36x–527x its quota
+  (measured: 2 threads granted ~89,000 tokens against a ~2,500 ceiling). Any
+  client able to send parallel requests through a 1.0.0 bucket could bypass the
+  limit. Fixed by the representation change below; the `rate-net` limiter
+  inherits the fix with no code change.
+- `cargo audit` / `cargo deny` are clean again: the dev-only advisories
+  RUSTSEC-2026-0204 (`crossbeam-epoch` via `criterion`) and RUSTSEC-2026-0190
+  (`anyhow` via `proptest`) are resolved by a lockfile refresh, and CI now
+  resolves a fresh lockfile before auditing.
+- `#![forbid(unsafe_code)]` locks in the crate's zero-`unsafe` status.
 
 ### Fixed
 
-### Security
+- **Over-grant from a stale clock reading (BB-COR-01).** A thread read the clock
+  before its CAS loop; if another thread committed a later timestamp first, the
+  stale reading's `wrapping_sub` produced a ~49.7-day "elapsed" time, refilled
+  the bucket to full, and wrote the older timestamp back. The state is now the
+  single instant the bucket would have been empty (the token-bucket reading of
+  GCRA): a grant only moves it forward, and a stale or backward reading only
+  sees fewer tokens. No skew window, no stall for long-idle buckets.
+- **Backward custom clocks refilled the bucket (BB-COR-04).** Same root cause,
+  same fix: a `Clock` that steps back now sees an emptier bucket until time
+  catches up.
+- **`available()` over-reported** under the same race; it now uses the same
+  arithmetic as a grant.
+- **Slow rates truncated or never refilled (BB-COR-02).** The Q22 millitoken
+  rate made 1/week refill 15.6% slow, 1/30 days 62% slow, and anything slower
+  than ~1 per 48.5 days never refill. Token amounts are now exact binary
+  fractions (for every rate up to ~4.3 × 10^9 tokens/second) and the clock
+  conversion is a 64-bit fixed-point rate whose error stays under one unit for
+  the bucket's whole life: one per day, week, 60 days, or century refills on
+  time.
+- **Frequent grants discarded the refill remainder.** Each grant wrote "now" as
+  the last refill and dropped the sub-millitoken fraction, so a 1-token/hour
+  bucket drained once a second never refilled. The refill is now a function of
+  absolute time and is never discarded.
+- **Silent capacity clamp (BB-COR-03).** Capacities above ~4.29 M tokens were
+  clamped, so `config().capacity()` and `capacity()` disagreed and an
+  in-capacity request was denied forever. Capacity is now exact for every
+  `u32`, and so is every grant for every `u32` amount per second; only rates
+  above ~4.3 × 10^9 tokens/second (which need a sub-second period) round each
+  grant up to a multi-token unit.
+- **Idle gaps of 2^32 ms or more under-refilled (BB-COR-05).** Time is now
+  nanoseconds that never wrap (at least ~438 years of range below 10^9
+  tokens/second, ~100 years above), so an idle gap of any length refills as
+  configured. Past the end of that range the clock is frozen and fails closed:
+  a charge that would land beyond it is refused, so even a caller-supplied
+  `Duration::MAX` reading can spend at most the tokens on hand.
+- `retry_after` no longer over-states waits for rates whose per-millisecond
+  refill was not an integer: 3 tokens per 7 ms now reports 7 ms, not 8 ms. It
+  remains rounded up to the millisecond and honest.
+
+### Added
+
+- **`BucketCore`** — the engine with caller-supplied time
+  (`Duration` since any epoch): `new`, `acquire_at`, `try_acquire_at`,
+  `acquire_up_to_at`, `available_at`, `time_until_at`, `reserve_at`, `refund`,
+  `reset_at`, `capacity`, `config`. Needs only `core` and a 64-bit atomic — the
+  real `no_std` path that 1.0's docs described but did not ship. Lock-free on
+  native 64-bit atomics.
+- **Caller-supplied time on `Bucket`**: `acquire_at`, `try_acquire_at`,
+  `available_at`, `time_until_at`, `acquire_up_to_at`, `reserve_at`, `reset_at`,
+  taking a `Monotonic` reading (one clock read for several buckets), and
+  `clock()` to get at the bucket's clock.
+- **`Bucket::with_config_and_clock(config, clock)`** and
+  **`BucketBuilder::build_with_clock(clock)`** — build once, read the clock once,
+  instead of `from_config(..).with_clock(..)` building twice (BB-PERF-03).
+- **`time_until(n)`** — the wait until `n` tokens could be acquired, without
+  taking any (`Some(ZERO)` now, `Some(wait)` as an upper bound, or `None` for
+  never).
+- **`refund(n)`** — return tokens for cancelled or failed work, capped at the
+  capacity.
+- **`reserve(n, max_wait)`** — take tokens ahead of their accrual and get the
+  wait; later callers queue behind it, so large requests cannot be starved by
+  small ones (BB-COR-06).
+- **`acquire_up_to(n)`** — partial grant: take what is available, up to `n`.
+- **`TokenBucket::time_until` and `TokenBucket::reset`**, with provided bodies so
+  existing implementations keep compiling; `Bucket` overrides both. The provided
+  `time_until` keeps `None` meaning "never" (`n` above the capacity) and answers
+  `Some(Duration::MAX)` — "not now, no better bound known" — when it cannot see
+  a rate; the provided `reset` does nothing.
+- **`BucketBuilder::build_config()`**, and `const fn` for `BucketBuilder::new`,
+  `capacity`, `refill`, `initial`, `Bucket::builder`, and `BucketConfig::new`
+  (compile-time-validated configurations).
+- **`Hash`** for `BucketConfig`, `Decision`, and `BucketError`.
+- **`serde` feature** (off by default): `Serialize` and a validating
+  `Deserialize` for `BucketConfig` that rejects unknown fields.
+- **`metrics` feature** (off by default): `BucketMetrics` with allowed / denied
+  / granted-token counters, via `metrics()` on `Bucket` and `BucketCore`. The
+  counters do not exist when the feature is off.
+- **`forge` feature**: the `error_forge::ForgeError` impl, now optional for a
+  core-only build. Implied by `clock`, so every 1.0 feature combination keeps it
+  (BB-CQ-02).
+- **`portable-atomic` feature** (off by default): `BucketCore` on targets
+  without native 64-bit atomics, such as `thumbv7em-none-eabihf`. There
+  portable-atomic's default fallback is a global spinlock: not lock-free, and
+  not interrupt-safe unless the final binary enables portable-atomic's
+  `unsafe-assume-single-core` or `critical-section` feature.
+- `examples/caller_driven.rs` — the `no_std`-style core driven by a tick counter.
+- Tests: a real-clock multi-thread grant-ceiling test (2–16 threads) and a
+  real-clock matrix of eight configurations × four operation mixes; a
+  deterministic stalled-reader test and a backward-clock test; `loom` models of
+  the real `Bucket` and `BucketCore` with the clock itself modelled as a loom
+  atomic (an advancing clock, stale readers, caller time from a shared atomic,
+  `reset`, `refund`, and `reserve` races; every model fails against a mutant
+  that replaces the CAS with a plain store); a `BucketCore` property suite over
+  `u32`-sized capacities, rates from one per month to ~4 × 10^18 per second, and
+  backward time (every window bounded, exact conservation, exact grant
+  boundary, honest hints, reservations); clock-horizon saturation tests at
+  `Duration::MAX` and 450–500 years; `serde` and `metrics` suites; and README /
+  `docs/API.md` examples run as doctests.
+
+### Changed
+
+- `BucketConfig`, `BucketBuilder` (except `build` / `build_with_clock`),
+  `Decision`, and `BucketError` are available without the `clock` feature;
+  `BucketError` implements `core::error::Error` in every build.
+- `Bucket<SystemClock>` is now exactly one 64-byte cache line (it was two)
+  without the `metrics` feature (BB-PERF-02).
+- `error-forge` requirement raised to `1.0.2`, which drops its unused
+  `thiserror` / `syn` build dependencies from the default tree.
+- CI: an aarch64 Linux runner, all-runtime-feature and per-feature test runs, a
+  `--all-features` clippy job, a real `no_std` build for `thumbv7em-none-eabihf`
+  (bare and with `portable-atomic`), a 32-bit Linux test job, a Miri job (also
+  over the `portable-atomic` path), an AddressSanitizer job, a
+  `cargo semver-checks` job, the `loom` job in release mode, and a fresh
+  lockfile before `cargo audit`.
+- `rustfmt.toml` drops the nightly-only `imports_granularity` and
+  `group_imports` options that stable rustfmt ignored with a warning.
+- Documentation corrected to match the code: the "proven by loom" and "never
+  over-grants" claims now describe what is actually checked (the 1.0 loom model
+  froze the clock); the `no_std` "caller drives time" text now describes a real
+  API; `Duration::MAX` is documented as "never" for both the over-capacity and
+  the beyond-the-clock-range case; the stale `0.2` / `0.3` / `Mutex` comments are
+  gone; the outdated claim that `leaky-bucket` uses a background task, the
+  unbenchmarked "fastest, safest in its class" claim, and the marketing tone
+  are removed; the CI-platform claim matches the matrix; emoji are removed from
+  the README, as REPS DOCUMENTATION requires.
+
+### Notes
+
+- **No breaking changes.** `cargo semver-checks` passes against 1.0.0; every
+  1.0 signature is unchanged and every new item is additive.
+- **Behaviour you may notice** (all of it bug or precision fixes):
+  - `capacity()` returns the configured value above ~4.29 M.
+  - Some `retry_after` values are a millisecond shorter (more exact).
+  - A bucket idle for 49.7+ days refills fully.
+  - Refill has nanosecond rather than millisecond resolution, so fast buckets
+    accrue between whole milliseconds: `per_second(10_000)` has 5 tokens back
+    500 µs after draining (1.0: 0), and a bucket polled every few microseconds
+    reaches its configured rate (1.0 under-granted, up to 10x).
+  - Rates above ~4.3 × 10^9 tokens/second (only reachable with a sub-second
+    period) charge each grant in whole multi-token units — `acquire(1)` on
+    `per_duration(u32::MAX, Duration::from_millis(1))` costs one 1,024-token
+    unit. 1.0 clamped such buckets to ~4.29 M capacity instead.
+  - A stale or backward clock reading is denied instead of refilling the
+    bucket.
+- **MSRV unchanged at Rust 1.85.**
+- Consumers on 1.0.0 should upgrade; `rate-net` should require `>= 1.1.0`.
 
 ---
 
@@ -408,7 +572,8 @@ implementation will be built on.
 - Libraries do not commit `Cargo.lock` (per portfolio convention); it is
   gitignored.
 
-[Unreleased]: https://github.com/jamesgober/better-bucket/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/jamesgober/better-bucket/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/jamesgober/better-bucket/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jamesgober/better-bucket/compare/v0.9.5...v1.0.0
 [0.9.5]: https://github.com/jamesgober/better-bucket/compare/v0.9.0...v0.9.5
 [0.9.0]: https://github.com/jamesgober/better-bucket/compare/v0.8.0...v0.9.0

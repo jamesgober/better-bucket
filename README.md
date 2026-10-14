@@ -20,43 +20,51 @@
 
 <div align="left">
     <p>
-        <strong>better-bucket</strong> is a <b>genuinely better token bucket</b> for Rust. 
-        The hot path — <code>try_acquire</code> — is <b>lock-free</b>, <b>allocation-free</b>, and <b>cache-aligned</b>, built on a single atomic compare-and-swap over a packed token/tick word. No background timer thread, no per-tick wakeups: refill is computed <em>lazily</em> from a monotonic clock the instant you ask. 
-        It is engineered for <b>maximum throughput</b>, <b>minimum overhead</b>, and <b>correctness under brutal contention</b> across <b>Linux</b>, <b>macOS</b>, and <b>Windows</b>.
+        <strong>better-bucket</strong> is a <b>lock-free token bucket</b> for Rust.
+        The hot path — <code>try_acquire</code> — is <b>lock-free</b> (on every target with native 64-bit atomics), <b>allocation-free</b>, and <b>cache-aligned</b>: a single atomic compare-and-swap on one word. No background timer thread, no per-tick wakeups: refill is computed <em>lazily</em> from a monotonic clock the instant you ask.
+        It runs the same on <b>Linux</b>, <b>macOS</b>, and <b>Windows</b>, and its caller-driven core runs in <code>no_std</code>.
     </p>
     <p>
-        Most "token bucket" crates make you choose between speed and a sane API. This one refuses the trade. The common case is one line — <code>Bucket::per_second(100)</code> then <code>bucket.try_acquire(1)</code> — and that one-line path <em>is</em> the fast path. Power users get a builder and a full trait surface; nobody is forced through generic soup to rate-limit a loop.
+        The common case is one line — <code>Bucket::per_second(100)</code> then <code>bucket.try_acquire(1)</code> — and that one-line path <em>is</em> the fast path. A builder, caller-supplied time, reservations, and a trait cover the rest without generic soup.
     </p>
     <p>
-        The safety contract is the headline feature: <b>the bucket never over-grants</b>. Across any concurrent interleaving, the total tokens handed out never exceed capacity plus accrued refill. That invariant is defended by <a href="https://github.com/tokio-rs/loom"><code>loom</code></a> model checking, a multi-thread stress test, and <code>proptest</code> — not by hope.
+        The safety contract is the point: <b>the bucket never over-grants</b>. Under any interleaving of concurrent callers, the tokens granted over any window never exceed the capacity plus what the rate accrues over that window. The state is the single instant the bucket would have been empty, so a stale or backward clock reading can only deny, never grant. That is checked by <a href="https://github.com/tokio-rs/loom"><code>loom</code></a> with an advancing clock, a real-clock multi-thread grant-ceiling test, and <code>proptest</code>.
     </p>
 </div>
+
+> **Upgrade from 1.0.0.** 1.0.0 over-granted by one to two orders of magnitude
+> under real-clock contention (a stale clock reading was read as a ~49.7-day
+> gap). 1.1.0 fixes it with no API change. See the
+> [CHANGELOG](./CHANGELOG.md#110--2026-10-13).
 
 <hr>
 <br>
 
-<h2>Why "better"?</h2>
+<h2>What it does</h2>
 
-A token bucket is simple to get working and surprisingly hard to get <em>right</em> — most implementations leak performance to a lock, leak correctness under contention, or leak ergonomics behind a generic builder. `better-bucket` targets all three at once:
-
-- **Lock-free acquire.** A single `compare_exchange_weak` on a packed `(tokens, last_refill_tick)` word. No `Mutex`, no `RwLock`, no parking on the hot path.
-- **Allocation-free steady state.** Acquiring never allocates. A bucket is a small, cache-line-aligned value with no heap tail.
-- **Lazy refill.** Tokens accrue from elapsed monotonic time, computed on access. No timer thread burning a core, no wakeups, no watts spent while idle.
-- **Overflow-safe.** Every refill and capacity computation is checked or saturating. A hostile request count or a multi-day idle gap can't wrap the counter or over-fill the bucket.
-- **Never over-grants.** The core safety invariant, defended by `loom` model checking, a multi-thread stress test, an allocation audit, an adversarial suite, and `proptest`.
-- **One-line API.** The 80% case is a constructor and a method call. No ceremony.
+- **Lock-free acquire.** A single `compare_exchange_weak` on one atomic word. No `Mutex`, no `RwLock`, no parking on the hot path. (On targets without native 64-bit atomics the optional `portable-atomic` path is lock-based; see Feature Flags.)
+- **Allocation-free.** No per-call operation allocates. A `Bucket<SystemClock>` is one 64-byte cache line with no heap tail.
+- **Lazy refill.** Tokens accrue from elapsed monotonic time, computed on access. No timer thread, no wakeups, nothing spent while idle.
+- **Never over-grants.** Stale readings, backward clocks, races, and readings past the end of the clock's range can only cause denials. Grants are exact token amounts for every rate up to ~4.3 × 10^9 tokens/second (every `u32` amount per second); the only slack is that a token may be granted a few nanoseconds before it is exactly due (or up to 2^-28 of a token early, for a bucket whose time to fill exceeds ~36 years).
+- **No wrap, no clamp.** Nanosecond time that never wraps (at least ~438 years of range below 10^9 tokens/second, ~100 years above), capacity exact for every `u32`, slow rates (one per day, one per year) refill on time.
+- **Honest retry hints.** A denial carries the wait until the request would succeed; `time_until` gives the same answer without spending a token.
+- **`no_std` core.** `BucketCore` takes the time from the caller and needs only `core` and a 64-bit atomic (`portable-atomic` covers targets without one).
+- **One-line API.** The 80% case is a constructor and a method call.
 
 <br>
 
 ## Features
 
-- **Token bucket core** — lock-free `try_acquire` / `acquire` (one `compare_exchange_weak` on a packed atomic word), allocation-free, cache-line aligned to avoid false sharing between independent buckets
+- **Token bucket core** — lock-free `try_acquire` / `acquire` on native 64-bit atomics (one `compare_exchange_weak` on one atomic word), allocation-free, cache-line aligned to avoid false sharing between independent buckets
 - **Lazy refill** — tokens accrue from monotonic elapsed time on access; no background threads, no timers
-- **Overflow-safe math** — checked / saturating arithmetic on every refill and capacity path
+- **Overflow-safe math** — checked / saturating / widened arithmetic everywhere; no input or idle gap can wrap the state
+- **Retry hints** — `Decision::Denied { retry_after }`, and the non-consuming `time_until(n)`
+- **Caller-supplied time** — every clock-reading method has an `*_at(now)` twin; `BucketCore` drops the clock entirely for `no_std` and simulations
+- **Reservations, refunds, partial grants** — `reserve(n, max_wait)` queues large requests fairly, `refund(n)` returns unused tokens, `acquire_up_to(n)` takes what is there
 - **Deterministic tests** — inject a mockable clock (via `clock-lib`) and advance time without `sleep`
-- **Tier-1 API** — `Bucket::per_second(n)` / `Bucket::per_duration(n, dur)` for the common case; `BucketConfig` for full control; a trait for the 1%
-- **No over-grant guarantee** — verified with `loom` model checking, an allocation audit, a multi-thread stress test, and `proptest`
-- **Zero `unsafe`** on the public path
+- **Tier-1 API** — `Bucket::per_second(n)` / `Bucket::per_duration(n, dur)` for the common case; `BucketConfig` and a builder for full control; a trait for the 1%
+- **Optional** — `serde` for `BucketConfig`, `metrics` counters (zero cost when off), `portable-atomic` for targets without 64-bit atomics
+- **Zero `unsafe`** — `#![forbid(unsafe_code)]`
 
 <hr>
 <br>
@@ -67,10 +75,13 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-better-bucket = "1"
+better-bucket = "1.1"
 
-# no_std build (no clock-lib; exposes only VERSION — see Feature Flags):
-better-bucket = { version = "1", default-features = false }
+# no_std, caller-driven core (BucketCore + config/decision/error types):
+better-bucket = { version = "1.1", default-features = false }
+
+# no_std on a target without 64-bit atomics (e.g. Cortex-M):
+better-bucket = { version = "1.1", default-features = false, features = ["portable-atomic"] }
 ```
 
 <hr>
@@ -125,9 +136,37 @@ let left = bucket.available();
 
 `build()` validates the configuration (rejecting zero capacity, zero refill
 amount, or zero refill period with a [`BucketError`]), so an invalid bucket can
-never be constructed. For a custom time source, chain `.with_clock(...)` onto the
-built bucket. If you prefer to build the config value yourself, `BucketConfig::new`
-plus `Bucket::from_config` is the same path without the fluent surface.
+never be constructed. `build_with_clock(clock)` takes a custom time source. If you
+prefer to build the config value yourself, `BucketConfig::new` plus
+`Bucket::from_config` — or `Bucket::with_config_and_clock(config, clock)` — is
+the same path without the fluent surface. With the `serde` feature a
+`BucketConfig` loads straight from a config file, with the same validation.
+
+<br>
+
+## Retry-After, Reservations, Refunds
+
+```rust
+use better_bucket::{Bucket, Decision};
+use std::time::Duration;
+
+let limiter = Bucket::per_second(10);
+
+// A denial says how long until the same request would succeed...
+if let Decision::Denied { retry_after } = limiter.acquire(20) {
+    let _ = retry_after; // Duration::MAX: 20 can never fit a capacity of 10
+}
+// ...and time_until asks the same question without spending anything.
+let _wait = limiter.time_until(5);
+
+// A large request that small ones keep starving: reserve its place, then wait.
+if let Some(wait) = limiter.reserve(10, Duration::from_secs(2)) {
+    std::thread::sleep(wait); // or an async timer
+}
+
+// Work that failed downstream gives its tokens back.
+limiter.refund(3);
+```
 
 <br>
 
@@ -157,6 +196,27 @@ clock.advance(Duration::from_secs(1));
 assert!(bucket.try_acquire(10)); // refilled
 ```
 
+<br>
+
+## No Clock at All (`no_std`)
+
+`BucketCore` is the same engine with the caller supplying the time as a
+`Duration` since any epoch — a tick counter, a timer peripheral, a simulation
+step:
+
+```rust
+use better_bucket::{BucketConfig, BucketCore};
+use core::time::Duration;
+
+let config = BucketConfig::new(5, 5, Duration::from_secs(1), 5).expect("valid");
+let uplink = BucketCore::new(config, Duration::ZERO);
+
+let now = Duration::from_millis(250);
+if uplink.try_acquire_at(1, now) {
+    // transmit
+}
+```
+
 <hr>
 <br>
 
@@ -164,85 +224,80 @@ assert!(bucket.try_acquire(10)); // refilled
 
 ### Lock-free, allocation-free hot path
 
-The bucket packs its mutable state — current tokens and the last-refill
-tick — into a single atomic word. `try_acquire` is a `compare_exchange_weak`
-loop:
+The bucket's whole mutable state is one atomic word: the instant the bucket
+would have been empty. `try_acquire(n)` is a `compare_exchange_weak` loop:
 
-1. Load the packed word.
-2. Compute lazy refill from monotonic elapsed time (saturating).
-3. If enough tokens, CAS the new `(tokens - n, now_tick)` in place.
-4. On CAS failure (another thread won the race), retry — emitting a CPU
-   spin-loop hint under contention to ease cache-line pressure.
+1. Read the clock and load the word.
+2. Clamp an idle bucket to full, then charge `n` tokens: `next = max(z, now − capacity) + n`.
+3. If `next` is after `now`, the tokens have not accrued: deny, without writing.
+4. Otherwise CAS `next` into place; on failure (another thread won), retry
+   against the value that won, with a CPU spin-loop hint.
 
-There is no lock, no allocation, and no syscall on the success path beyond the
+There is no lock, no allocation, and no division on the grant path beyond the
 monotonic clock read. Independent buckets sit on their own cache lines, so
 unrelated limiters never falsely share.
 
-### Lazy refill, no timer thread
+### Why a stale clock reading is harmless
 
-Refill is never pushed by a background thread. Tokens are computed from the
-elapsed monotonic time at the moment you call `try_acquire` / `available`.
-An idle bucket costs nothing — no wakeups, no spinning, no watts.
+A grant only ever moves the empty-instant forward. A thread holding a clock
+reading older than the last committed one — the race that made 1.0.0 over-grant
+— computes `now − z` as smaller, so it sees fewer tokens and is denied. A clock
+that steps backwards behaves the same way. There is no elapsed-time subtraction
+that can wrap into a phantom refill, and no skew window to tune.
 
-### The no-over-grant invariant
+### Exact tokens, no wrap
 
-The defining correctness property: **across any concurrent interleaving, the
-total tokens granted never exceed capacity plus the tokens legitimately
-accrued by refill.** This is the property that separates a correct rate
-limiter from a leaky one, and it is verified two ways:
+Token amounts are counted in exact binary fractions of a token, so for every
+rate up to ~4.3 × 10^9 tokens/second grants, refunds and the capacity never
+round (with the clock frozen, every token is conserved). Only faster buckets,
+which need a sub-second period, count in multi-token units and round each grant
+up to a whole unit. The clock reading is converted to those units by one multiply and
+one shift, rounded so an exactly-due token — five tokens 500 ms into a 10/s
+bucket — is granted on time. Time is nanoseconds since construction and never
+wraps; capacity is exact for every `u32`. Past the end of the clock's range
+(at least a century) the clock stops: the bucket hands out what it still holds
+and then denies. The details, and every rounding direction, are in
+[`docs/DESIGN.md`](./docs/DESIGN.md).
 
-- **`loom`** exhaustively explores the CAS interleavings of concurrent
-  `try_acquire` calls and asserts no lost update and no over-grant.
-- **A multi-thread stress test** hammers one bucket from many threads and
-  asserts the total granted never exceeds the available tokens.
-- **An allocation audit** runs the acquire path under a counting allocator and
-  asserts zero allocations.
-- **`proptest`** throws arbitrary sequences of acquires and time advances at
-  the bucket and asserts tokens always stay in `[0, capacity]` and grants
-  never exceed what refill allows.
+### How the no-over-grant contract is checked
 
-### Packed state and its limits
-
-State is one `AtomicU64`: the upper 32 bits hold tokens in millitokens (for
-sub-token refill resolution), the lower 32 bits hold milliseconds since the
-bucket was created. Two consequences follow from that budget:
-
-- **Capacity tops out around 4.29 million tokens** (`u32::MAX` millitokens).
-  That is an enormous burst ceiling for rate limiting; larger requests are
-  clamped to it.
-- **The millisecond counter wraps every ~49.7 days.** The wrap is handled
-  (elapsed time is computed with `wrapping_sub`), so an actively-used bucket
-  refills correctly indefinitely — there is no long-uptime stall. Only a bucket
-  left fully idle for longer than ~49.7 days may under-refill once on its next
-  use, a safe and self-correcting outcome.
+- **`loom`** model-checks the real `Bucket` and `BucketCore` with the clock
+  itself modelled as a shared atomic, so it explores every ordering of clock
+  reads and clock advances against the CAS (1.0.0's model froze the clock and
+  missed the bug; the new model finds it on the old code at once).
+- **A real-clock contention test** runs 2–16 threads against the system clock
+  and asserts total grants stay within capacity plus rate × elapsed.
+- **Deterministic clock tests** stall a thread between its clock read and its
+  CAS, and step a clock backwards.
+- **`proptest`** drives arbitrary rates and arbitrary (including backward) time
+  steps and checks every window of decisions, exact conservation, the exact
+  grant boundary, and the honesty of retry hints and reservations.
+- **An allocation audit** and **Miri** cover the rest.
 
 <hr>
 <br>
 
-The acquire path is division-free: the refill rate is precomputed at
-construction, so the hot path is one packed-word load, a multiply-and-shift, and
-a CAS. On a Ryzen 9 9950X3D the bucket's own accounting measures **~5 ns**
-(isolated with a mock clock). A real `try_acquire` adds one monotonic clock read
-on top — the dominant cost — for a single-thread figure of **~21 ns**, most of
-it the `Instant::now()` call rather than the bucket. Contended throughput scales
-with threads; the lock-free CAS has no lock to serialize on.
+## Performance
+
+The accounting is a load, a multiply-and-shift for the clock conversion, and a
+CAS. On this release's test host (Ryzen 9 9950X3D, Windows 11) the bucket's own
+work measures **~6.5 ns**, and `BucketCore::acquire_at` with a caller-supplied
+reading **~4.5 ns**; a real `try_acquire` adds one monotonic clock read on top —
+the dominant cost — for **~30–36 ns** single-threaded on Windows' QPC clock
+(Linux `Instant` reads are cheaper). Full numbers, method, and caveats are in
+[`docs/BENCHMARKS.md`](./docs/BENCHMARKS.md).
 
 ### vs `governor`
 
-Honest framing: `governor` is **GCRA** (store one timestamp, compare it) while
-`better-bucket` is a **token bucket** (track and refill a count, clamp to a
-capacity, support multi-token acquires, bursts, and introspection). GCRA does
-less work, so on the same monotonic clock `governor` is ~10–13% faster per call
-(~20 vs ~23 ns), and faster still out of the box because its default `quanta`
-clock beats the `Instant` clock `better-bucket` reads through `clock-lib`.
-
-`better-bucket` is the fastest, safest token bucket in *its* class — lock-free
-and allocation-free where `leaky-bucket` uses a background task and hand-rolled
-buckets use a `Mutex`, with a `loom`-proven no-over-grant contract and real token
-semantics. Reach for `governor` when a bare allow/deny decision is all you need;
-reach for `better-bucket` when you want an actual token bucket. Either way the
-end-to-end cost is bounded by the clock. Full numbers, method, and the honest
-analysis are in [`docs/BENCHMARKS.md`](./docs/BENCHMARKS.md).
+`governor` is **GCRA**: it tracks the same kind of single instant but answers only
+allow/deny. `better-bucket` is a **token bucket**: multi-token acquires, a burst
+capacity, an `available()` snapshot, `retry_after`, reservations, refunds, and
+partial grants. On the same monotonic clock the two are close per call, and
+`governor` is faster out of the box because its default `quanta` clock beats the
+`Instant` clock `better-bucket` reads through `clock-lib`. Reach for `governor`
+when a bare allow/deny is all you need, and for `better-bucket` when you want
+token semantics. The [`ratelimit`](https://crates.io/crates/ratelimit) crate is
+another lock-free token bucket; it has not been benchmarked here.
 
 ```bash
 cargo bench --bench bucket_bench            # better-bucket baselines
@@ -256,19 +311,30 @@ cargo bench --features comparison           # + the governor comparison
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `std`   | ✅      | Standard library. Off → `no_std`. |
-| `clock` | ✅      | Pluggable `clock-lib` time source: monotonic clock + mockable clock for tests. Implies `std` (clock-lib's `Clock` is std-gated). |
+| `std`   | yes     | Standard library. Off → `no_std`: `BucketCore`, `BucketConfig`, `BucketBuilder::build_config`, `Decision`, `BucketError`. |
+| `clock` | yes     | `Bucket`, `TokenBucket`, and the pluggable `clock-lib` time source (monotonic clock + mockable clock for tests). Implies `std` and `forge`. |
+| `forge` | yes (via `clock`) | `error_forge::ForgeError` for `BucketError`. |
+| `serde` | no      | `Serialize` / validating `Deserialize` for `BucketConfig`. |
+| `metrics` | no    | Allowed / denied / granted-token counters (`metrics()`). Zero cost when off. |
+| `portable-atomic` | no | `portable-atomic` for the state word, for targets without native 64-bit atomics. |
 
-```toml
-# no_std build (no clock-lib):
-better-bucket = { version = "1", default-features = false }
-```
+The `comparison` feature is benchmark-only — it pulls in `governor` for the
+head-to-head and is not part of the supported surface.
 
-> The lock-free accounting core uses only `core` atomics and is `no_std`-capable
-> in principle, but the shipped `Bucket` constructors read time from `clock-lib`
-> and therefore require the default `clock` feature (which implies `std`). A bare
-> `no_std` build currently exposes only the crate's `VERSION`; a caller-driven,
-> clock-free time API is a candidate for a future release.
+> **`portable-atomic` is not lock-free.** On a target with native 64-bit atomics
+> it compiles to them and changes nothing. On a target without them (e.g.
+> `thumbv7em-none-eabihf`) portable-atomic's default fallback protects the state
+> word with a global spinlock (a seqlock): not lock-free, and **not safe to call
+> from an interrupt handler** — an interrupt that hits a bucket while thread code
+> holds the lock spins forever on a single-core MCU. Firmware that touches a
+> bucket from interrupt context must enable portable-atomic's
+> `unsafe-assume-single-core` feature (single-core, privileged code: atomics
+> by disabling interrupts) or its `critical-section` feature (with a
+> `critical-section` implementation) in the final binary:
+>
+> ```toml
+> portable-atomic = { version = "1", default-features = false, features = ["unsafe-assume-single-core"] }
+> ```
 
 <br>
 
@@ -276,26 +342,30 @@ better-bucket = { version = "1", default-features = false }
 ## Testing
 
 ```bash
-# Unit + integration + property tests (default features = std + clock)
+# Unit + integration + property tests
 cargo test
-cargo test --no-default-features            # no_std build
+cargo test --features serde,metrics
+cargo test --no-default-features              # the no_std core (tests themselves use std)
+cargo build --no-default-features --features portable-atomic --target thumbv7em-none-eabihf
 
-# Concurrency model checking (no over-grant under interleaving)
-RUSTFLAGS="--cfg loom" cargo test --test loom_acquire
+# Concurrency model checking (advancing clock, every interleaving).
+# clock-lib 1.1.0 does not build under cfg(loom); pin 1.0.0 first.
+cargo update -p clock-lib --precise 1.0.0
+RUSTFLAGS="--cfg loom" cargo test --release --test loom_acquire
+
+# Miri (UB check)
+cargo +nightly miri test --lib --test core_properties
 
 # Benchmarks (add --features comparison for the governor head-to-head)
 cargo bench --bench bucket_bench
 
 # Format, lints, docs, and the security gates (all must be clean)
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+cargo clippy --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 cargo deny check
 cargo audit
 ```
-
-The `comparison` feature is benchmark-only — it pulls in `governor` for the
-head-to-head and is intentionally excluded from the default build and CI.
 
 <br>
 
@@ -313,17 +383,7 @@ pull in the rest of the family.
 <br>
 
 <div align="center">
-    <a href="./docs/DESIGN.md" title="A well designed bucket!"><img width="180px" height="auto" alt="rust bucket" src="./_assets/bucket.png"></a>
-    <br>
-    <sup>
-    <b>FASTER</b> 
-    <span>&nbsp;&plus;&nbsp;</span>
-    <b>LEANER</b>
-    <span>&nbsp;&plus;&nbsp;</span>
-    <b>SAFER</b>
-    </sup>
-    <br>
-    <strong>BETTER</strong>  
+    <a href="./docs/DESIGN.md" title="How the bucket works"><img width="180px" height="auto" alt="rust bucket" src="./_assets/bucket.png"></a>
 </div>
 
 <br>
@@ -332,20 +392,23 @@ pull in the rest of the family.
 ## Cross-Platform Support
 
 **Tier 1 Support:**
-- ✅ Linux (x86_64, aarch64)
-- ✅ macOS (x86_64, Apple Silicon)
-- ✅ Windows (x86_64)
+- Linux (x86_64, aarch64)
+- macOS (Apple Silicon; x86_64 builds from the same code but is not in CI)
+- Windows (x86_64)
 
-Behavior is identical across all three; the CI matrix runs every target on
-stable and MSRV. A commit that breaks any platform is a broken commit.
+Behavior is identical across all of them. CI runs Linux x86_64 and aarch64,
+macOS on Apple Silicon, and Windows x86_64 on stable and MSRV, plus a 32-bit
+Linux test job and a `no_std` build for `thumbv7em-none-eabihf`. A commit that
+breaks any platform is a broken commit.
 
 <br>
 
 ## Documentation
 
 - [**API Reference**](./docs/API.md) — every public item, parameters, examples.
-- [**Design**](./docs/DESIGN.md) — the packed-atomic core, the fixed-point
-  refill, the wrapping clock, and how the no-over-grant contract is defended.
+- [**Design**](./docs/DESIGN.md) — the single-instant state, exact token units,
+  the clock conversion and its rounding, and how the no-over-grant contract is
+  checked.
 - [**Benchmarks**](./docs/BENCHMARKS.md) — numbers, method, and the `governor`
   comparison.
 - [**Stability**](./docs/STABILITY.md) — the frozen `1.x` surface and the SemVer

@@ -6,147 +6,285 @@ API see [`API.md`](API.md); for numbers see [`BENCHMARKS.md`](BENCHMARKS.md).
 ## The one invariant
 
 Everything here serves a single safety contract: **the bucket never
-over-grants.** Across any concurrent interleaving, the total tokens handed out
-never exceed the initial fill plus what the configured rate legitimately accrues
-over the elapsed time, and the live token count always stays within
+over-grants.** Under any interleaving of concurrent callers, the tokens granted
+over any window of time never exceed the capacity plus what the configured rate
+accrues over that window, and the live token count always stays within
 `[0, capacity]`. Every design choice below is in service of making that true and
 cheap.
 
-## State: one atomic word
+`1.0.0` stated that contract and broke it: under ordinary multi-threaded use
+with the default clock it granted 36x–527x its quota (see
+[the 1.1.0 notes](release/v1.1.0.md)). The representation below is the fix, and
+the reason the fix needs no tuning.
 
-All mutable state is a single `AtomicU64`, split in two:
+## State: one instant in one atomic word
+
+A token bucket of capacity `C` refilling at rate `r` can be described by a
+single instant `z`: the moment the bucket would have been empty. At time `now`
+it holds
 
 ```
- 63                              32 31                               0
-┌─────────────────────────────────┬──────────────────────────────────┐
-│  tokens, in millitokens (u32)    │  milliseconds since construction  │
-└─────────────────────────────────┴──────────────────────────────────┘
+tokens(now) = min(C, (now − z) · r)
 ```
 
-- **Tokens are stored in millitokens** (thousandths of a token). A token bucket
-  must accrue *fractions* of a token between calls — at 100 tokens/second, 5 ms
-  is half a token — and dropping that fraction would make the bucket refill
-  slower than configured. Millitokens carry it. The cost is a capacity ceiling:
-  `u32::MAX` millitokens is about **4.29 million tokens**, which is an enormous
-  burst for rate limiting; larger configured capacities clamp to it.
-- **Time is milliseconds since construction.** Relative, not absolute, so it
-  fits in 32 bits.
+and granting `n` tokens moves `z` forward:
 
-Keeping both fields in one word is what makes the acquire path a single
+```
+z ← max(z, now − C/r) + n/r        allowed only if the new z ≤ now
+```
+
+The `max` clamps an idle bucket to "full"; the condition says the tokens must
+already have accrued. This is the token-bucket reading of GCRA, and the whole
+mutable state is that one instant, held in a single `AtomicU64`:
+
+```
+ 63                                                                 0
+┌───────────────────────────────────────────────────────────────────┐
+│   z: the empty-instant, in units since the bucket's epoch          │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+Keeping everything in one word is what makes the acquire path a single
 compare-and-swap. A design with two atomics (tokens and time separately) cannot
 update them together atomically, which reopens exactly the lost-update and
 over-grant races this crate exists to prevent.
 
-The whole struct is `#[repr(align(64))]` so independent buckets never share a
-cache line. Only the `state` word is ever written; the rate and capacity are
-immutable after construction, so they cannot cause false sharing.
+### Why not `(tokens, last_refill)`
 
-## Acquire: a CAS loop with lazy refill
+`1.0` packed a token count and a 32-bit "last refill" millisecond into the word
+and computed the refill as `now_ms.wrapping_sub(last_ms)`. Each thread read the
+clock before its CAS loop. A thread whose reading was older than the timestamp
+another thread had just committed got a "negative" elapsed time, which wrapped
+to ~49.7 days, refilled the bucket to full, and wrote the older timestamp back,
+so the next caller re-credited the same interval. The 32-bit time field also
+wrapped every 49.7 days, which forced the `wrapping_sub` in the first place, and
+every grant discarded the sub-millitoken refill remainder.
 
-`try_acquire(n)` reads the clock once, then:
+Patching that design means deciding how far "behind" a reading may be before it
+is treated as skew rather than a long idle gap — a window that either stalls
+long-idle buckets or leaves a smaller over-grant. The single-instant state needs
+no such window. A grant only ever moves `z` forward. A stale reading, or a clock
+that steps backwards, makes `now − z` *smaller*: the caller sees fewer tokens and
+is denied, never granted more. There is no subtraction that can wrap, because
+nothing wraps.
 
-1. Load the packed word; unpack `(tokens, last_ms)`.
-2. Compute the lazily-refilled token count as of now (saturating, clamped to
-   capacity).
-3. If `n` tokens are available, `compare_exchange_weak` the new
-   `(tokens − n, now)` into place; on success, allow. On CAS failure (another
-   thread won the race, or a spurious weak failure), retry from step 1.
-4. If not enough tokens, return a denial — **without writing**, so a denied
-   request never contends with a granting one.
+## Units: exact tokens, a converted clock
 
-There is no lock, no allocation, and no syscall on the success path beyond the
-monotonic clock read.
+`z` and `now` are measured in **units** of `2^-unit_shift` tokens, chosen per
+bucket at construction.
+
+- **Token amounts are exact** whenever a unit is at most one token, which is
+  every rate up to ~4.3 × 10^9 tokens/second. A grant of `n` tokens costs
+  `n << unit_shift` units, the capacity is `C << unit_shift`, a refund adds back
+  exactly what a grant took. With the clock frozen, every token is conserved —
+  granted, still available, or refunded — with no rounding at all. The
+  16-thread conservation test checks exactly this.
+- **The clock is converted once per call.** A reading in nanoseconds becomes
+  units by multiplying it by the rate in units per nanosecond, held as a `Q64`
+  fraction plus a small integer part: `units = (ns · rate_frac) >> 64` (the high
+  word of one 64×64-bit multiply), plus `ns · rate_int` for buckets of 10^9
+  tokens/second and above, whose clock runs faster than one unit per
+  nanosecond. The rate is rounded up. The conversion depends only on the
+  absolute reading, not on how many grants happened, so its error never
+  accumulates: over the whole clock range the converted reading is less than one
+  unit ahead of exact.
+
+`unit_shift` is the finest the word allows under these limits:
+
+- the capacity must fit in 61 bits of units;
+- below 10^9 tokens/second the clock must advance less than one unit per
+  nanosecond (`rate_int == 0`), so the word lasts at least ~438 years before the
+  reading saturates;
+- at 10^9 tokens/second and above, a unit stays one whole token as long as the
+  clock runs at most 4.3 units per nanosecond, which covers every `u32` amount
+  per second and still lasts at least ~100 years. Only faster buckets (above
+  ~4.3 × 10^9 tokens/second, which needs a sub-second period) count in
+  multi-token units and round each grant up to a whole unit — always charging
+  the caller, never the bucket.
+
+For typical buckets the clock limit binds and one unit is at most one or two
+nanoseconds of refill; for a bucket whose capacity is large relative to its
+rate the capacity limit binds and one unit is at most 2^-29 of a token.
+
+Every rounding in the system points the same way:
+
+| Quantity | Rounding | Effect |
+|---|---|---|
+| Grant cost (only above ~4.3 × 10^9 tokens/s) | up | a grant may cost up to one unit more |
+| Rate (`rate_int` + `rate_frac`) | up | the converted reading is less than one unit ahead of exact |
+| Clock reading → units | down | a token accrues at the first whole unit after it is due |
+| Full-bucket clamp | down, to the unit | a bucket that sat full is credited up to one unit early |
+| `retry_after` / `time_until` | up to the millisecond | waiting the hint is always enough |
+
+The rate is rounded *up* deliberately. An exact decimal boundary — 500 ms into a
+10/s bucket, where five tokens are exactly due — then lands on or just past the
+whole unit, so the grant happens at 500 ms and the hint says 500 ms. Rounding the
+rate down instead would push every such boundary one nanosecond late and turn
+every exact `retry_after` into the next millisecond up. Together with the
+full-bucket clamp, the cost is that a decision can be up to two units early: a
+token may be granted a few nanoseconds before it is exactly due — measured at
+0–2 ns for realistic buckets, with no compounding over repeated grants — or, for
+a bucket whose time to fill exceeds ~36 years, up to 2^-28 of a token early
+(microseconds to milliseconds of its very slow refill). That is the only slack
+in the no-over-grant contract.
+
+Instants are offset by 2^62 units so that the initial state (`now − cost(initial)`)
+and the full-bucket clamp (`now − burst`) can never underflow.
+
+### The end of the clock
+
+The converted reading saturates at `u64::MAX`, after at least ~438 years below
+10^9 tokens/second and ~100 years above. A saturated clock is frozen: nothing
+more accrues, so the bucket grants at most what it holds, and any charge that
+would land past `u64::MAX` is refused (`checked_add`, failing closed) rather
+than saturated into an allowed grant. A caller-supplied reading past the range —
+`Duration::MAX`, a garbage or hostile timestamp — is treated as that frozen
+instant: it can spend at most the tokens on hand, and afterwards the bucket
+sees an empty bucket at any sane reading. Validate untrusted timestamps before
+passing them to `BucketCore`.
+
+## Acquire: a CAS loop
+
+`try_acquire(n)` reads the clock once, converts it to units, then:
+
+1. Load the word: `z`.
+2. Compute `next = max(z, now − burst) + cost(n)`.
+3. If `next > now`, the tokens have not accrued: return a denial — **without
+   writing**, so a denied request never contends with a granting one. The
+   denial's `retry_after` is the time until the clock reaches `next`.
+4. Otherwise `compare_exchange_weak(z, next)`; on success, allow. On failure
+   (another thread won the race, or a spurious weak failure), retry from step 2
+   with the value that won, after a `spin_loop` hint.
+
+There is no lock (on native 64-bit atomics), no allocation, no division, and
+no syscall on the success path beyond the monotonic clock read. A retry does not re-read the clock: a stale
+reading is safe, and a fresh one would cost a clock read per retry under exactly
+the contention where it hurts most.
 
 ### Memory ordering
 
-The loads and the CAS use `Relaxed`. The bucket publishes no data alongside the
-counter — the only shared state is the one word — so all that is required is the
-read-modify-write *atomicity* the no-over-grant contract depends on, which a
-`Relaxed` CAS provides (a single atomic location always has a total modification
-order). Stronger ordering would buy nothing and cost on weakly-ordered targets.
-`loom` checks this directly.
+The loads and the CAS use `Relaxed`. The decision depends only on the one word,
+and the no-over-grant contract depends only on the read-modify-write
+*atomicity* of updates to it, which a `Relaxed` CAS provides: a single atomic
+location has a total modification order, and every successful CAS moves `z` up
+by at least the cost it grants. Ordering the clock read against other threads'
+commits — which the `1.0` design needed and lacked — buys nothing here, because
+any reading, however stale, can only deny more. Stronger ordering would add
+barriers on weakly-ordered targets for no change in what can be granted. `loom`
+checks this with the clock itself modelled as a shared atomic.
 
-## Refill: division-free fixed point
+## Time: nanoseconds, no wrap
 
-The refilled token count is
+`Bucket` measures time as the nanoseconds elapsed since it was built
+(`clock.now()` against a stored `Monotonic` anchor); `BucketCore` takes the
+caller's `Duration` since any epoch. Either way the reading saturates at
+~584 years and the unit clock at ≥ ~438 years (≥ ~100 years at 10^9
+tokens/second and above); past that the clock is frozen, as described above. Nothing wraps, so an idle gap of any length — a minute, 49.7 days,
+a decade — refills exactly as configured. `1.0`'s once-per-49.7-days
+under-refill and its "fills to capacity only by luck of the modulus" long-idle
+test are gone.
 
-```
-tokens + elapsed_ms × (millitokens per millisecond)   (clamped to capacity)
-```
+A reading earlier than the bucket's anchor counts as the anchor: `Bucket` uses
+`saturating_duration_since`, so a reading taken just before construction can
+never panic or refill.
 
-Computing `millitokens-per-ms` as `refill_amount × 1e9 / period_nanos` on every
-acquire would put a 128-bit division on the hot path. Instead the rate is
-precomputed once at construction as a **`Q22` fixed-point** multiplier
-(millitokens-per-ms scaled by `2^22`), so the hot path is a multiply and a
-shift. Deriving the rate from the period in *nanoseconds* keeps sub-millisecond
-periods accurate even though the time field ticks in milliseconds. When no whole
-millisecond has elapsed since the last refill — the common case under bursty
-load — the computation is skipped entirely.
+## Reservations, refunds, partial grants
 
-The denial's `retry_after` is the inverse: the time for the shortfall to accrue,
-computed with a **ceiling** so the hint never under-promises. Ceiling-for-the-wait
-and floor-for-the-refill must agree, or a caller that waited exactly as long as
-told could still be denied; the `retry_after_is_an_honest_lower_bound` property
-test proves they do.
+The single-instant state makes three operations that a `(tokens, time)` word
+could not support cleanly fall out for free:
 
-## Time: wrapping, not saturating
-
-The 32-bit millisecond field wraps every ~49.7 days. Elapsed time is computed
-with `wrapping_sub`, which recovers the true interval for any gap shorter than
-that window — i.e. for any bucket touched at least once per ~49.7 days, which is
-every real limiter. So an actively-used bucket refills correctly **indefinitely**.
-
-An earlier design *saturated* the field at `u32::MAX`, which made a long-running
-bucket stop refilling after ~49.7 days — a latent outage for a primitive meant
-to run for months. Wrapping removes it. The only residual edge is a bucket left
-*fully idle* for longer than the window, which may under-refill once on its next
-use: a safe, conservative, self-correcting outcome (it never over-grants, only
-under-grants briefly).
+- **`reserve(n, max_wait)`** takes the tokens immediately even if they have not
+  accrued, moving `z` past `now`, and returns how long until they are covered.
+  Later callers see `z > now` and queue behind it. This is what prevents a large
+  request from being starved by a stream of small ones (a plain token bucket has
+  no queue, so it is starvable by design). `max_wait` bounds how far into the
+  future a caller can push the bucket.
+- **`refund(n)`** moves `z` back by `cost(n)`. The `max(z, now − burst)` clamp on
+  every read caps the visible balance at the capacity, so an over-refund cannot
+  overfill the bucket. Refunding tokens that were never acquired is the caller's
+  decision and lies outside the over-grant contract, as does `reset`.
+- **`acquire_up_to(n)`** grants `min(n, available)` in one CAS — the
+  byte-throttling shape.
 
 ## Overflow safety
 
-Every refill and capacity computation is saturating or checked. A hostile
-request count, an enormous elapsed gap, or a near-infinite rate cannot wrap the
-counter or over-fill the bucket: intermediate products use `u128`, accrual
-saturates, and the result is clamped to capacity. Construction rejects
-nonsensical configurations (zero capacity, amount, or period) up front with a
-`BucketError`, rather than producing a bucket that misbehaves later. The Tier-1
+Every computation is checked, saturating, or widened to `u128`. A request above
+the capacity is rejected before any arithmetic. Costs stay below 2^61 because
+the capacity does; the clock product `ns · rate_q` is below 2^127; waits that
+would end beyond the clock's range are reported as `Duration::MAX` ("never")
+rather than computed. Construction rejects nonsensical configurations (zero
+capacity, amount, or period) up front with a `BucketError`; the Tier-1
 constructors stay infallible by interpreting a degenerate argument as a bucket
-that grants nothing.
+that grants nothing. There is no configuration `BucketConfig::new` accepts that
+the bucket cannot hold: the 4.29 M-token capacity clamp and the "rates slower
+than ~1 per 48.5 days never refill" floor of `1.0` are gone. The only
+approximation left is the multi-token unit above ~4.3 × 10^9 tokens/second.
 
 ## How the contract is defended
 
-- **`loom`** exhaustively explores the CAS interleavings of concurrent
-  `try_acquire` calls and asserts the bucket grants exactly the available tokens
-  — no over-grant, no lost token. Under `--cfg loom` the `state` word is a
-  `loom` atomic so the model checker sees it.
-- **A multi-thread stress test** hammers one bucket from eight threads with no
-  refill and asserts exactly the capacity is granted.
-- **An allocation audit** runs the acquire path under a per-thread counting
-  allocator and asserts zero allocations.
-- **`proptest`** asserts, over a wide input space, that tokens stay within
-  `[0, capacity]`, grants never exceed the initial fill plus accrued refill, and
-  the `retry_after` hint is honest.
-- **An adversarial/edge suite** covers `u32::MAX` requests, `u32::MAX` capacity,
-  extreme and near-zero rates, the capacity boundary matrix, zero-time-delta, a
-  non-advancing clock, multi-year advances, and concurrent acquire-while-reset.
+- **`loom`** model-checks the real `Bucket` and `BucketCore`, with the clock
+  modelled as a loom atomic so it explores every ordering of clock reads and
+  advances against the CAS: a reader overtaken by a thread that advanced the
+  clock and committed (the `1.0` bug, which this model finds immediately on the
+  old code), two advances interleaved with three acquires, caller-supplied time
+  read from a shared atomic, `reset` and `refund` racing acquires, and a
+  reservation racing a grant.
+- **A real-clock contention test** runs 2–16 threads against a `SystemClock`
+  bucket and asserts the total granted against the ceiling the configuration
+  allows over the measured wall time. `1.0` fails it by thousands of tokens.
+- **Deterministic clock tests** pause a thread between its clock read and its
+  CAS while another drains the bucket, and step a custom clock backwards; both
+  must grant nothing extra.
+- **`proptest`** drives `BucketCore` with arbitrary rates and arbitrary time
+  steps, including backwards ones, and checks: no window of decisions exceeds
+  capacity plus accrual; backward readings never add tokens; a frozen clock
+  conserves every token through acquires, partial grants and refunds;
+  `available` is the exact grant boundary; the retry hint equals `time_until`
+  and is honest; reservations never commit more than is covered by their wait.
+- **An allocation audit** runs every per-call operation under a per-thread
+  counting allocator and asserts zero allocations.
+- **An adversarial/edge suite** covers `u32::MAX` requests and capacities,
+  extreme and near-zero rates, idle gaps across the old 2^31/2^32 ms
+  boundaries, multi-century readings, the capacity boundary matrix, and
+  concurrent acquire-while-reset with a bounded total.
+- **Miri** runs the unit, property, and edge suites.
 
 ## The clock is the floor
 
 The bucket's own accounting is a few nanoseconds. End-to-end, `try_acquire` is
 dominated by the monotonic clock read (`Instant::now()` via
 [`clock-lib`](https://crates.io/crates/clock-lib)). Against `governor` on the
-same clock, `governor` is a little faster per call — it is GCRA (one timestamp,
-one compare), which does less work than a token bucket's count-and-refill, so a
-few nanoseconds separate them. Out of the box `governor` is faster still because
-its default `quanta` clock beats `Instant`. The token-bucket accounting here is
-already at its floor; the remaining end-to-end gap is the clock, a `clock-lib`
-concern (a faster monotonic source), not a bucket one. See
-[`BENCHMARKS.md`](BENCHMARKS.md) for the numbers and the honest analysis.
+same clock, `governor` is a little faster per call — it is GCRA, which tracks
+the same single instant but has no token semantics to compute. Out of the box
+`governor` is faster still because its default `quanta` clock beats `Instant`.
+The remaining end-to-end gap is the clock, a `clock-lib` concern (a faster
+monotonic source), not a bucket one. See [`BENCHMARKS.md`](BENCHMARKS.md) for
+the numbers.
 
 The clock is **injected** (`Bucket<C: Clock>`), so a consumer or test supplies
 its own — chiefly `clock-lib`'s `ManualClock`, which makes time-driven behaviour
-deterministic with no `sleep`.
+deterministic with no `sleep`. The `*_at` methods take a reading instead, so a
+keyed limiter can read the clock once per request and decide for many buckets.
+`BucketCore` drops the clock altogether.
+
+## `no_std`
+
+The engine needs only `core` and a 64-bit atomic. Without `std`, the crate
+exposes `BucketCore` (caller-driven time), `BucketConfig`, `BucketBuilder`'s
+`build_config`, `Decision`, and `BucketError` (which implements
+`core::error::Error`). Targets with no native 64-bit atomics — Cortex-M among
+them — get `BucketCore` through the optional `portable-atomic` feature; without
+it they still get the configuration and decision types.
+
+On such a target portable-atomic's default fallback guards the word with a
+global spinlock (a seqlock), so the engine is **not lock-free and not
+interrupt-safe** there: an interrupt handler that calls into a bucket while
+thread code holds the lock spins forever on a single core. Firmware that uses a
+bucket from interrupt context enables portable-atomic's
+`unsafe-assume-single-core` feature (atomics by briefly disabling interrupts,
+for single-core privileged code) or its `critical-section` feature in the final
+binary; better-bucket leaves that choice to the binary, as portable-atomic
+recommends for libraries.
 
 ## Decisions, recorded
 
@@ -154,16 +292,27 @@ deterministic with no `sleep`.
   limiting do not share the `TokenBucket` trait cleanly and belong in the
   downstream `rate-net`. This crate owns token-bucket accounting and nothing
   else.
-- **Plain `u32`, not `NonZeroU32`, on the Tier-1 path.** Friendlier than the
-  incumbent's API; a zero argument yields a well-defined deny-all bucket rather
-  than forcing the caller to wrap every literal. The validated, error-returning
-  path is `BucketConfig::new` / the builder.
+- **A single instant, not `(tokens, time)`.** Stale and backward readings become
+  harmless by construction, time stops wrapping, and capacity and slow rates
+  stop clamping (see above).
+- **Exact token units, a rounded-up clock.** Token conservation is exact up to
+  ~4.3 × 10^9 tokens/second; the clock conversion is rounded up so exact
+  boundaries are hit rather than missed, at the cost of a few nanoseconds of
+  slack.
+- **`retry_after` stays at millisecond resolution**, rounded up, as `1.0`
+  promised. It is an honest upper bound, and what `Retry-After` headers and most
+  timers consume.
+- **Plain `u32`, not `NonZeroU32`, on the Tier-1 path.** A zero argument yields a
+  well-defined deny-all bucket rather than forcing the caller to wrap every
+  literal. The validated, error-returning path is `BucketConfig::new` / the
+  builder.
 - **No keyed store here.** Per-key state (the sharded map, eviction, quotas) is
   the consumer's concern. This crate is the single-bucket primitive.
-- **Zero `unsafe` on the public path.** The packing trick needs none.
+- **No blocking or async wait.** `reserve` returns the delay; the caller sleeps
+  with whatever timer fits its runtime. Async waiting lives in `rate-net`.
+- **Zero `unsafe`.** `#![forbid(unsafe_code)]`.
 - **No SIMD.** A single-bucket acquire is one CAS on one word — no
-  lane-parallelism to exploit, and no consumer needs batched multi-bucket
-  acquire.
+  lane-parallelism to exploit.
 
 ---
 

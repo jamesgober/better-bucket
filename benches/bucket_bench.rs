@@ -1,17 +1,18 @@
 //! Criterion baselines for the lock-free acquire path.
 //!
-//! Three measurements, matching the roadmap's basic suite: the single-thread
-//! `try_acquire` hot path, contended acquire across several thread counts, and
-//! the refill computation after a long idle gap. Numbers are recorded in
-//! `docs/BENCHMARKS.md`; the comparative benchmark against `governor` lands with
-//! the optimization milestone.
+//! The single-thread `try_acquire` hot path (with the real clock, and isolated
+//! from it), the caller-driven `BucketCore` path, the deny path that computes a
+//! retry hint, contended acquire across several thread counts, and the refill
+//! computation after a long idle gap. Numbers are recorded in
+//! `docs/BENCHMARKS.md`; the comparison against `governor` is in
+//! `benches/comparison.rs`.
 
 use std::hint::black_box;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use better_bucket::Bucket;
+use better_bucket::{Bucket, BucketCore};
 use clock_lib::ManualClock;
 use criterion::{Criterion, criterion_group, criterion_main};
 
@@ -43,6 +44,45 @@ fn bench_algorithm_only(c: &mut Criterion) {
                 bucket.reset();
             }
         });
+    });
+}
+
+/// The caller-driven engine with a fixed reading: no clock at all, so this is
+/// the accounting alone, as a `no_std` caller (or a keyed limiter amortising one
+/// clock read across many buckets) sees it.
+fn bench_core_acquire_at(c: &mut Criterion) {
+    // 1M tokens/second, burst 1M, starting full.
+    let config = Bucket::per_second(1_000_000).config();
+    let bucket = BucketCore::new(config, Duration::ZERO);
+    let now = Duration::from_millis(1);
+    let _ = c.bench_function("core/acquire_at", |b| {
+        b.iter(|| {
+            if !bucket.try_acquire_at(black_box(1), black_box(now)) {
+                bucket.reset_at(now);
+            }
+        });
+    });
+}
+
+/// The deny path: an empty bucket that never refills within the benchmark,
+/// so every call computes and returns a `retry_after` hint. This is the path an
+/// abusive client exercises.
+fn bench_deny_with_retry_hint(c: &mut Criterion) {
+    let clock = Arc::new(ManualClock::new());
+    let bucket = Bucket::per_second(10).with_clock(Arc::clone(&clock));
+    let _ = bucket.try_acquire(10); // drain
+    let _ = c.bench_function("acquire/denied_with_retry_after", |b| {
+        b.iter(|| black_box(bucket.acquire(black_box(1))));
+    });
+}
+
+/// `time_until` on a drained bucket: the non-consuming Retry-After query.
+fn bench_time_until(c: &mut Criterion) {
+    let clock = Arc::new(ManualClock::new());
+    let bucket = Bucket::per_second(10).with_clock(Arc::clone(&clock));
+    let _ = bucket.try_acquire(10); // drain
+    let _ = c.bench_function("time_until/drained", |b| {
+        b.iter(|| black_box(bucket.time_until(black_box(1))));
     });
 }
 
@@ -100,6 +140,9 @@ criterion_group!(
     benches,
     bench_single_thread,
     bench_algorithm_only,
+    bench_core_acquire_at,
+    bench_deny_with_retry_hint,
+    bench_time_until,
     bench_contended,
     bench_refill_after_idle
 );
