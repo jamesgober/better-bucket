@@ -51,7 +51,7 @@
 
 ```toml
 [dependencies]
-better-bucket = "1.1"
+better-bucket = "1.2"
 ```
 
 `no_std` build — [`BucketCore`](#the-no_std-core-bucketcore) with
@@ -61,10 +61,10 @@ caller-supplied time, plus `BucketConfig`, `BucketBuilder::build_config`,
 
 ```toml
 [dependencies]
-better-bucket = { version = "1.1", default-features = false }
+better-bucket = { version = "1.2", default-features = false }
 
 # Targets without native 64-bit atomics (e.g. Cortex-M):
-better-bucket = { version = "1.1", default-features = false, features = ["portable-atomic"] }
+better-bucket = { version = "1.2", default-features = false, features = ["portable-atomic"] }
 ```
 
 MSRV is **1.85** (Rust 2024 edition).
@@ -459,6 +459,60 @@ let bucket = Bucket::per_second(10);
 assert!(bucket.try_acquire(10));
 bucket.refund(4); // the upstream call for 4 of them failed
 assert!(bucket.available() >= 4);
+```
+
+Above ~4.3 × 10^9 tokens/second a refund rounds down to whole multi-token
+units, so it never credits more than it returns *(1.2)*.
+
+### `Bucket::charge`
+
+```rust,ignore
+pub fn charge(&self, n: u32)                      // (1.2)
+pub fn charge_at(&self, n: u32, now: Monotonic)   // (1.2)
+```
+
+Records `n` tokens as already spent, with no capacity check: usage that
+happened outside the bucket, such as a provider reporting more tokens used than
+were acquired. It always succeeds. The balance may go below zero, and later
+grants wait until the debt has refilled. One CAS loop whatever `n` is. The debt
+is not capped, so bound a number you do not trust before charging it.
+
+**Examples**
+
+```rust
+use better_bucket::Bucket;
+
+let bucket = Bucket::per_second(10);
+bucket.charge(25); // 15 tokens of debt
+assert!(!bucket.try_acquire(1));
+```
+
+### `Bucket::postpone_at`
+
+```rust,ignore
+pub fn postpone_at(&self, by: Duration, at: Monotonic)   // (1.2)
+```
+
+Moves the bucket's schedule `by` later, as if its clock had stood still for
+`by` starting at `at`. At `at + by` the bucket holds what it held at `at`, and
+every outstanding reservation comes due `by` later, so queued waiters keep
+their spacing across a pause instead of all coming due when it ends. It never
+adds tokens. `at` may be in the past, for a pause settled after it ended.
+
+**Examples**
+
+```rust
+use std::sync::Arc;
+use std::time::Duration;
+use better_bucket::Bucket;
+use clock_lib::{Clock, ManualClock};
+
+let clock = Arc::new(ManualClock::new());
+let bucket = Bucket::per_second(10).with_clock(Arc::clone(&clock));
+assert!(bucket.try_acquire(10));
+assert_eq!(bucket.reserve(10, Duration::from_secs(5)), Some(Duration::from_secs(1)));
+bucket.postpone_at(Duration::from_secs(3), clock.now()); // a 3 s pause
+assert_eq!(bucket.time_until(1), Some(Duration::from_millis(4_100)));
 ```
 
 ---
@@ -975,6 +1029,8 @@ pub fn available_at(&self, now: Duration) -> u32
 pub fn time_until_at(&self, n: u32, now: Duration) -> Option<Duration>
 pub fn reserve_at(&self, n: u32, max_wait: Duration, now: Duration) -> Option<Duration>
 pub fn refund(&self, n: u32)
+pub fn charge_at(&self, n: u32, now: Duration)          // (1.2)
+pub fn postpone_at(&self, by: Duration, now: Duration)  // (1.2)
 pub fn reset_at(&self, now: Duration)
 pub const fn capacity(&self) -> u32
 pub const fn config(&self) -> BucketConfig

@@ -27,6 +27,8 @@ Everything below is committed under the SemVer contract.
 `time_until`, `time_until_at`, `acquire_up_to`, `acquire_up_to_at`, `reserve`,
 `reserve_at`, `refund`, `reset_at`, `clock`, and `metrics` (`metrics` feature).
 
+*(1.2)* `charge`, `charge_at`, `postpone_at`.
+
 Implements `Debug`, `Send`, and `Sync` (the latter two whenever `C` is).
 
 ### `BucketCore` *(1.1)*
@@ -37,7 +39,7 @@ feature, which is lock-based and not interrupt-safe where the target has no
 native 64-bit atomics). `new`, `acquire_at`, `try_acquire_at`, `acquire_up_to_at`,
 `available_at`, `time_until_at`, `reserve_at`, `refund`, `reset_at`,
 `capacity`, `config`, and `metrics` (`metrics` feature). Implements `Debug`,
-`Send`, `Sync`.
+`Send`, `Sync`. *(1.2)* `charge_at`, `postpone_at`.
 
 ### `BucketBuilder`
 
@@ -163,7 +165,8 @@ Documented and stable for `1.x`:
 - The exact text of `Display` / `Debug` output.
 - Internal performance characteristics (timings may improve or shift), and the
   size of `Bucket` / `BucketCore` (currently one 64-byte cache line on 64-bit
-  targets without `metrics`).
+  targets without `metrics`: always for `BucketCore`, in release builds for
+  `Bucket<SystemClock>`; with `metrics`, 128 and 192 bytes).
 - The exact `retry_after` value beyond "an honest upper bound at millisecond
   resolution": `1.1` reports some waits a millisecond shorter than `1.0` did,
   because `1.0`'s rate truncation is gone.

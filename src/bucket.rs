@@ -592,6 +592,75 @@ impl<C: Clock> Bucket<C> {
         &self.clock
     }
 
+    /// Records `n` tokens as already spent, with no capacity check.
+    ///
+    /// For usage that happened outside the bucket, such as a provider
+    /// reporting more tokens used than were acquired. It always succeeds: the
+    /// balance may go below zero, and later grants wait until the debt has
+    /// refilled. One CAS loop whatever `n` is. The debt is not capped, so bound
+    /// a number you do not trust before charging it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::Bucket;
+    ///
+    /// let bucket = Bucket::per_second(10);
+    /// bucket.charge(25); // 15 tokens of debt
+    /// assert_eq!(bucket.available(), 0);
+    /// assert!(!bucket.try_acquire(1));
+    /// ```
+    pub fn charge(&self, n: u32) {
+        self.core.charge(n, self.elapsed());
+    }
+
+    /// [`charge`](Self::charge) at a caller-supplied clock reading; see
+    /// [`acquire_at`](Self::acquire_at).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::Bucket;
+    /// use clock_lib::Clock;
+    ///
+    /// let bucket = Bucket::per_second(10);
+    /// let now = bucket.clock().now();
+    /// bucket.charge_at(10, now);
+    /// assert_eq!(bucket.available_at(now), 0);
+    /// ```
+    pub fn charge_at(&self, n: u32, now: Monotonic) {
+        self.core.charge(n, self.elapsed_at(now));
+    }
+
+    /// Moves the bucket's schedule `by` later, as if its clock had stood still
+    /// for `by` starting at `at`.
+    ///
+    /// At `at + by` the bucket holds what it held at `at`, and every
+    /// outstanding reservation comes due `by` later, so queued waiters keep
+    /// their spacing instead of all coming due together. A full bucket is full
+    /// again at `at + by`, and holds less until then. No tokens are ever added. `at` may be in the past, for a pause
+    /// that is being settled after it ended.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    /// use better_bucket::Bucket;
+    /// use clock_lib::{Clock, ManualClock};
+    ///
+    /// let clock = Arc::new(ManualClock::new());
+    /// let bucket = Bucket::per_second(10).with_clock(Arc::clone(&clock));
+    /// assert!(bucket.try_acquire(10));
+    /// // A reservation due in 1 s, then a 3 s pause: it is due in 4 s.
+    /// assert_eq!(bucket.reserve(10, Duration::from_secs(5)), Some(Duration::from_secs(1)));
+    /// bucket.postpone_at(Duration::from_secs(3), clock.now());
+    /// assert_eq!(bucket.time_until(1), Some(Duration::from_millis(4_100)));
+    /// ```
+    pub fn postpone_at(&self, by: Duration, at: Monotonic) {
+        self.core.postpone(by, self.elapsed_at(at));
+    }
+
     /// Refills the bucket to full and marks it current as of now.
     ///
     /// Use it to discard accumulated debt (including outstanding reservations)
@@ -1037,8 +1106,17 @@ mod tests {
     #[test]
     fn test_system_clock_bucket_is_one_cache_line() {
         assert_eq!(core::mem::align_of::<Bucket<SystemClock>>(), 64);
-        #[cfg(all(not(feature = "metrics"), target_pointer_width = "64"))]
+        // `Bucket` holds clock-lib's `Monotonic`, which from clock-lib 1.2 is
+        // larger in debug builds (it carries a source tag there). The one-line
+        // guarantee is for release builds; a debug build may take two lines.
+        #[cfg(all(
+            not(feature = "metrics"),
+            not(debug_assertions),
+            target_pointer_width = "64"
+        ))]
         assert_eq!(core::mem::size_of::<Bucket<SystemClock>>(), 64);
+        #[cfg(all(not(feature = "metrics"), target_pointer_width = "64"))]
+        assert!(core::mem::size_of::<Bucket<SystemClock>>() <= 128);
     }
 
     #[test]

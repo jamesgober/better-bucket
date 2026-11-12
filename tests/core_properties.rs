@@ -278,4 +278,81 @@ proptest! {
             }
         }
     }
+
+    /// Above ~4.3 x 10^9 tokens/second a unit is several tokens. With the
+    /// clock frozen, refunding a grant in pieces must never return more than
+    /// was taken: no refund makes held plus available grow. (Refunds round
+    /// down there, so a few tokens may be lost to rounding, never minted.)
+    #[test]
+    fn core_fast_regime_partial_refunds_never_mint(
+        capacity in 8_u32..=100_000,
+        amount in 1_000_000_000_u32..=u32::MAX,
+        period_ns in 1_u64..=200_000_000,
+        steps in proptest::collection::vec((0_u8..3, 1_u32..=600), 0..96),
+    ) {
+        let config = BucketConfig::new(capacity, amount, Duration::from_nanos(period_ns), capacity).unwrap();
+        let t = at(1_234_567);
+        let bucket = BucketCore::new(config, t);
+        let mut held = 0_u64;
+        for (kind, n) in steps {
+            match kind {
+                0 => {
+                    if bucket.try_acquire_at(n, t) {
+                        held += u64::from(n);
+                    }
+                }
+                1 => held += u64::from(bucket.acquire_up_to_at(n, t)),
+                _ => {
+                    let before = held + u64::from(bucket.available_at(t));
+                    let back = u32::try_from(held.min(u64::from(n))).unwrap();
+                    bucket.refund(back);
+                    held -= u64::from(back);
+                    // A refund may lose a fraction of a unit to rounding, but
+                    // held plus available must never grow.
+                    let after = held + u64::from(bucket.available_at(t));
+                    prop_assert!(
+                        after <= before,
+                        "refund({}) minted {} tokens", back, after - before
+                    );
+                }
+            }
+        }
+    }
+
+    /// `charge_at` never grants: the balance after a charge is never above
+    /// the balance before it, and a debt of `n` delays the next token by the
+    /// refill time of the debt.
+    #[test]
+    fn core_charge_never_adds_tokens(
+        setup in exact_setups(),
+        charges in proptest::collection::vec((0_u32..=u32::MAX / 4, 0_u64..=100_000_000), 1..16),
+    ) {
+        let bucket = BucketCore::new(setup.config(), Duration::ZERO);
+        let mut now = 0_u64;
+        for (n, step) in charges {
+            now += step;
+            let before = bucket.available_at(at(now));
+            bucket.charge_at(n, at(now));
+            let after = bucket.available_at(at(now));
+            prop_assert!(after <= before);
+            prop_assert_eq!(after, before.saturating_sub(n));
+        }
+    }
+
+    /// `postpone_at` never grants, and at `now + by` the bucket holds what it
+    /// held at `now`.
+    #[test]
+    fn core_postpone_freezes_the_balance(
+        setup in exact_setups(),
+        drain in 0_u32..=u32::MAX,
+        now_ns in 0_u64..=1_000_000_000,
+        by_ns in 0_u64..=10_000_000_000,
+    ) {
+        let bucket = BucketCore::new(setup.config(), Duration::ZERO);
+        let _ = bucket.acquire_up_to_at(drain, at(now_ns));
+        let before = bucket.available_at(at(now_ns));
+        bucket.postpone_at(at(by_ns), at(now_ns));
+        prop_assert!(bucket.available_at(at(now_ns)) <= before);
+        prop_assert_eq!(bucket.available_at(at(now_ns + by_ns)), before);
+    }
 }
