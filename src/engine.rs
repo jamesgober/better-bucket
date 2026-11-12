@@ -184,7 +184,14 @@ impl Scale {
 }
 
 /// Allowed / denied / granted-token counters, behind the `metrics` feature.
+///
+/// Aligned to a cache line of their own, so the increments never touch the
+/// line that holds `state`: a denial, which only reads `state`, then does not
+/// invalidate the line a granting CAS needs. The counters are still one shared
+/// line, so concurrent calls on one bucket contend on it; see the `metrics`
+/// feature notes in the README.
 #[cfg(feature = "metrics")]
+#[repr(align(64))]
 struct Counters {
     allowed: AtomicU64,
     denied: AtomicU64,
@@ -192,7 +199,8 @@ struct Counters {
 }
 
 /// The shared engine: the packed state plus the immutable rate and the
-/// configuration it was built from. 48 bytes without `metrics`.
+/// configuration it was built from. 48 bytes without `metrics`; with it, the
+/// counters sit on a second cache line and the engine is 128 bytes.
 pub(crate) struct Core {
     /// The empty-instant `z`, in units offset by [`ORIGIN`]. The only mutable
     /// accounting state and the single point of synchronisation.
@@ -294,6 +302,35 @@ impl Core {
         }
     }
 
+    /// Units that refunding `n` tokens credits back. Exact when a unit is at
+    /// most one token, like [`cost`](Self::cost); for faster buckets it rounds
+    /// **down** to whole units, so a refund never credits more than it
+    /// returns. (`cost` rounds up, which charges the caller; a refund that
+    /// reused it would credit the bucket up to one unit too much each time.)
+    #[inline]
+    fn refund_units(&self, n: u32) -> u64 {
+        let n = u64::from(n);
+        let shift = self.unit_shift.unsigned_abs();
+        if self.unit_shift >= 0 {
+            n << shift
+        } else {
+            n >> shift
+        }
+    }
+
+    /// Units that a debt of `n` tokens costs, for any `n` (not only up to the
+    /// capacity): rounded up like [`cost`](Self::cost), saturating at
+    /// `u64::MAX`.
+    #[inline]
+    fn debt_units(&self, n: u32) -> u64 {
+        let shift = self.unit_shift.unsigned_abs();
+        if self.unit_shift >= 0 {
+            u64::try_from(u128::from(n) << shift).unwrap_or(u64::MAX)
+        } else {
+            self.cost(n)
+        }
+    }
+
     /// Units in a full bucket: the cost of a full-capacity grant.
     #[inline]
     fn burst(&self) -> u64 {
@@ -364,8 +401,9 @@ impl Core {
                 Some(next) if next <= now_u => next,
                 overflowed_or_short => {
                     // Denied: report the wait for the shortfall to accrue. No
-                    // write, so a denied request never contends with a granting
-                    // one.
+                    // write to the state, so a denied request never contends
+                    // with a granting one. (With `metrics`, the denial counter
+                    // is incremented on its own cache line.)
                     self.record_denied();
                     let retry_after = overflowed_or_short
                         .and_then(|next| self.wait_until(next, now))
@@ -533,15 +571,76 @@ impl Core {
     /// Returns up to `n` tokens to the bucket (never beyond capacity).
     pub(crate) fn refund(&self, n: u32) {
         let n = n.min(self.capacity);
-        if n == 0 {
+        let cost = self.refund_units(n);
+        if cost == 0 {
             return;
         }
-        let cost = self.cost(n);
         let mut current = self.state.load(Ordering::Relaxed);
         loop {
             // Moving `z` earlier adds credit; the `max(z, now − burst)` clamp on
             // every read caps the visible balance at capacity.
             let next = current.saturating_sub(cost);
+            match self.state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => {
+                    current = actual;
+                    core::hint::spin_loop();
+                }
+            }
+        }
+    }
+
+    /// Records `n` tokens as spent at `now`, with no capacity check: the
+    /// balance may go below zero, and later grants wait until the debt has
+    /// refilled. One CAS loop, whatever `n` is.
+    pub(crate) fn charge(&self, n: u32, now: Duration) {
+        let cost = self.debt_units(n);
+        if cost == 0 {
+            return;
+        }
+        let floor = self.units(now).saturating_sub(self.burst());
+        let mut current = self.state.load(Ordering::Relaxed);
+        loop {
+            // A debt past the end of the clock's range saturates there: the
+            // bucket then stays empty, which fails closed.
+            let next = current.max(floor).saturating_add(cost);
+            match self.state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => {
+                    current = actual;
+                    core::hint::spin_loop();
+                }
+            }
+        }
+    }
+
+    /// Moves the bucket's schedule `by` later, as if its clock had stood still
+    /// for `by` from `now`: the balance at `now + by` is the balance at `now`,
+    /// and every outstanding reservation comes due `by` later. Only ever
+    /// moves `z` forward, so it can never grant more.
+    pub(crate) fn postpone(&self, by: Duration, now: Duration) {
+        if by.is_zero() {
+            return;
+        }
+        let start = self.units(now);
+        let span = self.units(now.saturating_add(by)).saturating_sub(start);
+        if span == 0 {
+            return;
+        }
+        let floor = start.saturating_sub(self.burst());
+        let mut current = self.state.load(Ordering::Relaxed);
+        loop {
+            let next = current.max(floor).saturating_add(span);
             match self.state.compare_exchange_weak(
                 current,
                 next,
@@ -620,6 +719,8 @@ impl Core {
 /// range (at least a century; `Duration::MAX`, a garbage timestamp) is treated
 /// as the frozen end of time: it can spend at most the tokens on hand, and the
 /// bucket then looks empty at any sane reading. Validate untrusted timestamps.
+/// [`reset_at`](Self::reset_at) recovers a bucket that such a reading emptied,
+/// at the cost of forgetting any debt it held.
 ///
 /// # Atomics
 ///
@@ -856,6 +957,71 @@ impl BucketCore {
         self.core.refund(n);
     }
 
+    /// Records `n` tokens as already spent at time `now`, with no capacity
+    /// check.
+    ///
+    /// For usage that happened outside the bucket, such as a provider
+    /// reporting more tokens used than were acquired. Unlike an acquire it
+    /// always succeeds: the balance may go below zero, and later grants wait
+    /// until the debt has refilled. The cost is one CAS loop whatever `n` is,
+    /// so a large debt is as cheap as a small one. Above ~4.3 x 10^9
+    /// tokens/second the debt rounds up to a whole unit, like a grant.
+    ///
+    /// The debt is not capped. A caller charging a number it does not trust
+    /// should bound it first, or one bad report can empty the bucket for a long
+    /// time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::{BucketConfig, BucketCore};
+    /// use core::time::Duration;
+    ///
+    /// let config = BucketConfig::new(10, 10, Duration::from_secs(1), 10)?;
+    /// let bucket = BucketCore::new(config, Duration::ZERO);
+    /// bucket.charge_at(30, Duration::ZERO); // 20 tokens of debt
+    /// assert_eq!(bucket.available_at(Duration::ZERO), 0);
+    /// assert_eq!(bucket.time_until_at(1, Duration::ZERO), Some(Duration::from_millis(2_100)));
+    /// # Ok::<(), better_bucket::BucketError>(())
+    /// ```
+    pub fn charge_at(&self, n: u32, now: Duration) {
+        self.core.charge(n, now);
+    }
+
+    /// Moves the bucket's schedule `by` later, as if its clock had stood still
+    /// for `by` starting at `now`.
+    ///
+    /// At `now + by` the bucket holds what it held at `now`, and every
+    /// outstanding reservation comes due `by` later than it was, so queued
+    /// waiters keep their spacing instead of all coming due together. A full
+    /// bucket is full again at `now + by`, and holds less until then. It never
+    /// adds tokens.
+    ///
+    /// Use it when a downstream asks for a pause: postponing the schedule by
+    /// the pause keeps the reservations made before it from being released at
+    /// once when it ends.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use better_bucket::{BucketConfig, BucketCore};
+    /// use core::time::Duration;
+    ///
+    /// let config = BucketConfig::new(10, 10, Duration::from_secs(1), 0)?;
+    /// let bucket = BucketCore::new(config, Duration::ZERO);
+    /// // A reservation due in 1 s.
+    /// let max = Duration::from_secs(5);
+    /// assert_eq!(bucket.reserve_at(10, max, Duration::ZERO), Some(Duration::from_secs(1)));
+    /// // A 3 s pause: it is now due in 4 s.
+    /// bucket.postpone_at(Duration::from_secs(3), Duration::ZERO);
+    /// assert_eq!(bucket.time_until_at(1, Duration::from_secs(4)), Some(Duration::from_millis(100)));
+    /// assert_eq!(bucket.available_at(Duration::from_secs(5)), 10);
+    /// # Ok::<(), better_bucket::BucketError>(())
+    /// ```
+    pub fn postpone_at(&self, by: Duration, now: Duration) {
+        self.core.postpone(by, now);
+    }
+
     /// Refills the bucket to capacity as of `now`, discarding any debt or
     /// outstanding reservation.
     ///
@@ -982,6 +1148,110 @@ mod tests {
         assert_eq!(core::mem::align_of::<BucketCore>(), 64);
         #[cfg(not(feature = "metrics"))]
         assert_eq!(core::mem::size_of::<BucketCore>(), 64);
+        #[cfg(feature = "metrics")]
+        assert_eq!(core::mem::size_of::<BucketCore>(), 128);
+    }
+
+    /// With `metrics`, the counters must not share the state's cache line, or
+    /// every denial (a read of the state) would write to the line a granting
+    /// CAS needs.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn test_metrics_counters_sit_off_the_state_line() {
+        let state = core::mem::offset_of!(Core, state);
+        let counters = core::mem::offset_of!(Core, counters);
+        let size = core::mem::size_of::<super::Counters>();
+        let line = state / 64;
+        assert!(
+            counters / 64 != line && (counters + size - 1) / 64 != line,
+            "counters at offset {counters} share the state's line (state at {state})"
+        );
+    }
+
+    /// Above ~4.3 x 10^9 tokens/second a unit is 4 tokens here. Refunds round
+    /// down, so returning a grant one token at a time never mints tokens.
+    #[test]
+    fn test_core_fast_regime_refunds_round_down() {
+        // 10^9 tokens per 100 ms = 10 tokens/ns: one unit is 4 tokens.
+        let bucket = core(1_000, 1_000_000_000, ms(100), 1_000);
+        assert_eq!(bucket.acquire_up_to_at(1_000, T0), 1_000);
+        for _ in 0..250 {
+            bucket.refund(1);
+        }
+        // 750 tokens are still held; at most 250 may be available again.
+        assert!(
+            bucket.available_at(T0) <= 250,
+            "minted: {}",
+            bucket.available_at(T0)
+        );
+
+        // The settle pattern: take 8, give 1 back. Never more than capacity in
+        // use plus available.
+        let bucket = core(1_000, 1_000_000_000, ms(100), 1_000);
+        let mut used = 0_u32;
+        for _ in 0..125 {
+            assert!(bucket.try_acquire_at(8, T0));
+            bucket.refund(1);
+            used += 7;
+        }
+        assert!(used + bucket.available_at(T0) <= 1_000);
+
+        // Whole units still refund exactly.
+        let bucket = core(1_000, 1_000_000_000, ms(100), 1_000);
+        assert!(bucket.try_acquire_at(400, T0));
+        bucket.refund(400);
+        assert_eq!(bucket.available_at(T0), 1_000);
+    }
+
+    #[test]
+    fn test_core_charge_records_debt_in_one_step() {
+        let bucket = core(10, 10, ms(1_000), 10);
+        bucket.charge_at(0, T0);
+        assert_eq!(bucket.available_at(T0), 10);
+        bucket.charge_at(4, T0);
+        assert_eq!(bucket.available_at(T0), 6);
+        // Far beyond the capacity: a debt, not a refusal.
+        bucket.charge_at(1_000_006, T0);
+        assert_eq!(bucket.available_at(T0), 0);
+        assert_eq!(bucket.time_until_at(1, T0), Some(ms(100_000_100)));
+        // A charge on a full, long-idle bucket starts from the full balance.
+        let bucket = core(10, 10, ms(1_000), 0);
+        bucket.charge_at(15, ms(60_000));
+        assert_eq!(bucket.time_until_at(1, ms(60_000)), Some(ms(600)));
+        // The largest charge saturates instead of wrapping, and fails closed.
+        let bucket = core(u32::MAX, u32::MAX, Duration::from_nanos(1), u32::MAX);
+        bucket.charge_at(u32::MAX, T0);
+        bucket.charge_at(u32::MAX, T0);
+        assert_eq!(bucket.available_at(T0), 0);
+    }
+
+    #[test]
+    fn test_core_postpone_keeps_reservations_spaced() {
+        // 10/s, burst 10, empty: five reservations 100 ms apart.
+        let bucket = core(10, 10, ms(1_000), 0);
+        let waits: std::vec::Vec<_> = (0..5)
+            .map(|_| bucket.reserve_at(1, Duration::MAX, T0).unwrap())
+            .collect();
+        assert_eq!(waits, [ms(100), ms(200), ms(300), ms(400), ms(500)]);
+        // A 5 s pause from t = 0 moves the whole schedule 5 s later.
+        bucket.postpone_at(ms(5_000), T0);
+        assert_eq!(bucket.available_at(ms(5_000)), 0);
+        assert_eq!(bucket.time_until_at(1, ms(5_000)), Some(ms(600)));
+        assert_eq!(bucket.available_at(ms(5_600)), 1);
+        // A full bucket is full again when the pause ends, and gains nothing.
+        let bucket = core(10, 10, ms(1_000), 10);
+        bucket.postpone_at(ms(5_000), T0);
+        assert_eq!(bucket.available_at(ms(5_000)), 10);
+        assert!(!bucket.try_acquire_at(11, ms(60_000)));
+        // A partly drained one holds the same balance at the end of the pause.
+        let bucket = core(10, 10, ms(1_000), 10);
+        assert!(bucket.try_acquire_at(6, T0));
+        bucket.postpone_at(ms(2_000), T0);
+        assert_eq!(bucket.available_at(ms(2_000)), 4);
+        assert_eq!(bucket.available_at(ms(2_300)), 7);
+        // Zero is a no-op; a past start (a pause settled after it ended) works.
+        bucket.postpone_at(Duration::ZERO, T0);
+        assert_eq!(bucket.available_at(ms(2_300)), 7);
     }
 
     #[test]

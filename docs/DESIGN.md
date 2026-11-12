@@ -76,7 +76,7 @@ bucket at construction.
 - **Token amounts are exact** whenever a unit is at most one token, which is
   every rate up to ~4.3 × 10^9 tokens/second. A grant of `n` tokens costs
   `n << unit_shift` units, the capacity is `C << unit_shift`, a refund adds back
-  exactly what a grant took. With the clock frozen, every token is conserved —
+  exactly what a grant took (in this regime only; see below for faster buckets). With the clock frozen, every token is conserved —
   granted, still available, or refunded — with no rounding at all. The
   16-thread conservation test checks exactly this.
 - **The clock is converted once per call.** A reading in nanoseconds becomes
@@ -99,8 +99,11 @@ bucket at construction.
   clock runs at most 4.3 units per nanosecond, which covers every `u32` amount
   per second and still lasts at least ~100 years. Only faster buckets (above
   ~4.3 × 10^9 tokens/second, which needs a sub-second period) count in
-  multi-token units and round each grant up to a whole unit — always charging
-  the caller, never the bucket.
+  multi-token units. A grant rounds up to a whole unit, which charges the
+  caller. A refund rounds down, so it never credits more than it returns: a
+  refund of less than one unit credits nothing, and refunding a grant in pieces
+  can lose up to one unit per refund, never mint one. (Before 1.2 refunds also
+  rounded up, so partial refunds could add tokens.)
 
 For typical buckets the clock limit binds and one unit is at most one or two
 nanoseconds of refill; for a bucket whose capacity is large relative to its
@@ -150,8 +153,11 @@ passing them to `BucketCore`.
 1. Load the word: `z`.
 2. Compute `next = max(z, now − burst) + cost(n)`.
 3. If `next > now`, the tokens have not accrued: return a denial — **without
-   writing**, so a denied request never contends with a granting one. The
-   denial's `retry_after` is the time until the clock reaches `next`.
+   writing** the state, so a denied request never contends with a granting one.
+   The denial's `retry_after` is the time until the clock reaches `next`. (With
+   `metrics`, a denial increments a counter, on a cache line of its own so it
+   never touches the state's line; denials then contend with each other on the
+   counters line.)
 4. Otherwise `compare_exchange_weak(z, next)`; on success, allow. On failure
    (another thread won the race, or a spurious weak failure), retry from step 2
    with the value that won, after a `spin_loop` hint.

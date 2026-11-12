@@ -14,6 +14,48 @@
 
 ---
 
+## [1.2.0] - 2026-11-12
+
+A fix release with two additive methods. Every 1.1 call site compiles and keeps
+its meaning.
+
+### Fixed
+
+- **Refunds could add tokens above ~4.3 x 10^9 tokens/second.** In that regime
+  a unit is several tokens, and `refund` rounded each refund up to a whole unit,
+  so refunding a grant in pieces credited more than it returned (1,000 tokens
+  available after refunding 250 of a 1,000-token grant one at a time). Refunds
+  now round down: a refund never credits more than it returns, and may lose up
+  to one unit to rounding. Rates up to ~4.3 x 10^9 tokens/second (every `u32`
+  amount per second) were exact before and are unchanged. A new property test
+  covers partial refunds on fast buckets.
+- **`cargo test` failed against clock-lib 1.2.** clock-lib 1.2 adds a field to
+  `Monotonic` in debug builds, so `Bucket<SystemClock>` is two cache lines in a
+  debug build. The layout test now checks the one-line size in release builds
+  only, where the guarantee holds, and the README says so. `BucketCore`, which
+  holds no clock, is one line in every build.
+
+### Changed
+
+- **`metrics` counters moved to their own cache line.** They shared the state's
+  line, so every denial wrote to the line a granting CAS needs. An 8-thread
+  denial flood drops from about 130 to 160 ns to about 65 to 90 ns per denial
+  on the test host; it is about 5 ns without `metrics`. With `metrics`,
+  `BucketCore` stays at 128 bytes and `Bucket<SystemClock>` grows from 128 to
+  192 bytes in release builds. The README now explains the cost, and that Cargo
+  feature unification turns `metrics` on for every user of the crate in a
+  build.
+
+### Added
+
+- `BucketCore::charge_at`, `Bucket::charge` and `Bucket::charge_at`: record
+  usage beyond the balance as debt in one CAS loop, whatever its size.
+- `BucketCore::postpone_at` and `Bucket::postpone_at`: move the schedule later
+  as if the clock had stood still, so reservations queued before a pause keep
+  their spacing when it ends.
+
+---
+
 ## [1.1.0] — 2026-10-13
 
 A correctness release with additive features. **Upgrade from 1.0.0 is strongly
@@ -572,7 +614,8 @@ implementation will be built on.
 - Libraries do not commit `Cargo.lock` (per portfolio convention); it is
   gitignored.
 
-[Unreleased]: https://github.com/jamesgober/better-bucket/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/jamesgober/better-bucket/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/jamesgober/better-bucket/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/jamesgober/better-bucket/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jamesgober/better-bucket/compare/v0.9.5...v1.0.0
 [0.9.5]: https://github.com/jamesgober/better-bucket/compare/v0.9.0...v0.9.5

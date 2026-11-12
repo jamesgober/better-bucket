@@ -43,7 +43,7 @@
 <h2>What it does</h2>
 
 - **Lock-free acquire.** A single `compare_exchange_weak` on one atomic word. No `Mutex`, no `RwLock`, no parking on the hot path. (On targets without native 64-bit atomics the optional `portable-atomic` path is lock-based; see Feature Flags.)
-- **Allocation-free.** No per-call operation allocates. A `Bucket<SystemClock>` is one 64-byte cache line with no heap tail.
+- **Allocation-free.** No per-call operation allocates. In release builds a `Bucket<SystemClock>` is one 64-byte cache line with no heap tail (a `BucketCore` is one line in every build).
 - **Lazy refill.** Tokens accrue from elapsed monotonic time, computed on access. No timer thread, no wakeups, nothing spent while idle.
 - **Never over-grants.** Stale readings, backward clocks, races, and readings past the end of the clock's range can only cause denials. Grants are exact token amounts for every rate up to ~4.3 × 10^9 tokens/second (every `u32` amount per second); the only slack is that a token may be granted a few nanoseconds before it is exactly due (or up to 2^-28 of a token early, for a bucket whose time to fill exceeds ~36 years).
 - **No wrap, no clamp.** Nanosecond time that never wraps (at least ~438 years of range below 10^9 tokens/second, ~100 years above), capacity exact for every `u32`, slow rates (one per day, one per year) refill on time.
@@ -61,6 +61,7 @@
 - **Retry hints** — `Decision::Denied { retry_after }`, and the non-consuming `time_until(n)`
 - **Caller-supplied time** — every clock-reading method has an `*_at(now)` twin; `BucketCore` drops the clock entirely for `no_std` and simulations
 - **Reservations, refunds, partial grants** — `reserve(n, max_wait)` queues large requests fairly, `refund(n)` returns unused tokens, `acquire_up_to(n)` takes what is there
+- **Debt and pauses** *(1.2)*: `charge(n)` records usage beyond the balance in one step, `postpone_at(by, at)` moves the schedule later so queued reservations keep their spacing across a pause
 - **Deterministic tests** — inject a mockable clock (via `clock-lib`) and advance time without `sleep`
 - **Tier-1 API** — `Bucket::per_second(n)` / `Bucket::per_duration(n, dur)` for the common case; `BucketConfig` and a builder for full control; a trait for the 1%
 - **Optional** — `serde` for `BucketConfig`, `metrics` counters (zero cost when off), `portable-atomic` for targets without 64-bit atomics
@@ -75,13 +76,13 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-better-bucket = "1.1"
+better-bucket = "1.2"
 
 # no_std, caller-driven core (BucketCore + config/decision/error types):
-better-bucket = { version = "1.1", default-features = false }
+better-bucket = { version = "1.2", default-features = false }
 
 # no_std on a target without 64-bit atomics (e.g. Cortex-M):
-better-bucket = { version = "1.1", default-features = false, features = ["portable-atomic"] }
+better-bucket = { version = "1.2", default-features = false, features = ["portable-atomic"] }
 ```
 
 <hr>
@@ -315,8 +316,21 @@ cargo bench --features comparison           # + the governor comparison
 | `clock` | yes     | `Bucket`, `TokenBucket`, and the pluggable `clock-lib` time source (monotonic clock + mockable clock for tests). Implies `std` and `forge`. |
 | `forge` | yes (via `clock`) | `error_forge::ForgeError` for `BucketError`. |
 | `serde` | no      | `Serialize` / validating `Deserialize` for `BucketConfig`. |
-| `metrics` | no    | Allowed / denied / granted-token counters (`metrics()`). Zero cost when off. |
+| `metrics` | no    | Allowed / denied / granted-token counters (`metrics()`). Zero cost when off; see the note below for the cost when on. |
 | `portable-atomic` | no | `portable-atomic` for the state word, for targets without native 64-bit atomics. |
+
+> **What `metrics` costs.** The counters live on a second cache line, so a
+> `BucketCore` is 128 bytes instead of 64 (and a `Bucket<SystemClock>` 192 in
+> release builds). Every call then does one or two relaxed atomic increments on
+> that shared line. The line is separate from the state, so the increments never
+> slow a granting CAS, but a denial is no longer read-only, and many threads
+> denied by one bucket contend on the counters line: about 65 to 90 ns per
+> denial in an 8-thread flood on a loaded test host, against about 5 ns without
+> `metrics` (130 to 160 ns in 1.1, where the counters shared the state's line).
+> Cargo unifies features, so one crate in the build that enables
+> `better-bucket/metrics` turns it on, with this size and cost, for every user
+> of the crate in that build, including per-key stores. Enable it in the final
+> application only.
 
 The `comparison` feature is benchmark-only — it pulls in `governor` for the
 head-to-head and is not part of the supported surface.
