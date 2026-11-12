@@ -605,7 +605,6 @@ implementation will be built on.
 - `.gitattributes` normalising line endings to LF and keeping
   development-only paths out of `git archive` tarballs.
 - `clippy.toml` and `rustfmt.toml` lint/format configuration.
-- `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) — gitignored.
 
 ### Notes
 
